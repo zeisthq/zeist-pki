@@ -31,7 +31,7 @@ amd64/arm64 binary archives. It publishes:
 - GitHub build-provenance attestations for release archives and the immutable
   OCI digest.
 
-The image receives both the release tag and `latest`; deploy Zeist using the
+The image receives both the release tag and `latest`; deploy your platform using the
 immutable digest reported by the release workflow, not the moving tag.
 
 ## Verify a release

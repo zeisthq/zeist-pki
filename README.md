@@ -64,12 +64,11 @@ matching confirmation to recover another independent trust domain.
 
 ## Quick start
 
-Plan, bootstrap, and inspect the Zeist-compatible Kubernetes configuration:
+Inspect a configuration without contacting Kubernetes:
 
 ```sh
-go run ./cmd/zeist-pki plan --config examples/zeist/pki.yaml --offline
-go run ./cmd/zeist-pki apply --config examples/zeist/pki.yaml
-go run ./cmd/zeist-pki status --config examples/zeist/pki.yaml
+go run ./cmd/zeist-pki plan --config examples/kubernetes/pki.yaml --offline
+go run ./examples/generic
 ```
 
 Use `plan --offline` when no Kubernetes configuration is available or when a
@@ -78,9 +77,6 @@ state, generates key material, acquires a Lease, or writes state.
 
 The portable API is demonstrated by
 [`examples/generic`](examples/generic); it requires no Kubernetes dependency.
-For the Zeist Kubernetes integration, read the deployment ordering in
-[Zeist integration](docs/zeist-integration.md). The examples use real interface
-values but deliberately contain no credentials or private key material.
 
 ## Library layers
 
@@ -104,10 +100,8 @@ replay-safe rollover phases. Treat issuer-state backups as high-value
 signing-key material; the [backup and recovery guide](docs/backup-and-recovery.md)
 documents the fail-closed recovery procedure.
 
-Zeist-specific output compatibility and deployment ordering are described in
-[Zeist integration](docs/zeist-integration.md). Security reports are covered
-by [SECURITY.md](SECURITY.md), and contribution expectations by
-[CONTRIBUTING.md](CONTRIBUTING.md).
+Security reports are covered by [SECURITY.md](SECURITY.md), and contribution
+expectations by [CONTRIBUTING.md](CONTRIBUTING.md).
 
 Release artifacts are created only after a successful version-tag workflow;
 see [Releasing](docs/releasing.md) for the generated checksums, signatures,

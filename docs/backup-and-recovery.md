@@ -8,8 +8,8 @@ the trust domain.
 ## What to protect
 
 Back up each domain’s authoritative state as one encrypted, access-controlled
-unit. For the Kubernetes integration, this is the issuer-state Secret (for
-example `zeist-webhook-pki-state` or `zeist-mtls-pki-state`) containing:
+unit. For the Kubernetes integration, this is the issuer-state Secret for the
+affected trust domain containing:
 
 - `active-ca.crt` and `active-ca.key`;
 - `candidate-ca.crt` and `candidate-ca.key` only during a root rollover; and

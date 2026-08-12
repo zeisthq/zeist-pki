@@ -40,7 +40,7 @@ jobs:
       - name: Exercise documented examples
         run: |
           go run ./examples/generic
-          go run ./cmd/zeist-pki plan --offline --config examples/zeist/pki.yaml
+          go run ./cmd/zeist-pki plan --offline --config examples/kubernetes/pki.yaml
 
   envtest:
     runs-on: ubuntu-24.04

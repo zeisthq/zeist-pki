@@ -1,0 +1,15 @@
+apiVersion: pki.zeist.io/v1alpha1
+namespace: platform-system
+acknowledgementNamespace: pki-acknowledgements
+webhook:
+  service: platform-webhook
+  secret: platform-webhook-tls
+  canaryService: platform-webhook-rotation-canary
+  canarySecret: platform-webhook-rotation-canary-tls
+  canaryConfiguration: platform-pki-rotation-canary
+mtls:
+  serverSecret: platform-server-tls
+  clientSecret: platform-client-tls
+  nodeSelector:
+    platform.example.io/private-tls: "true"
+  port: 10443

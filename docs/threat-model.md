@@ -31,10 +31,9 @@ compromise, not permission to issue certificates.
 
 Consumer acknowledgement writers are also trusted to report the material that
 their own process has activated. The verifier binds an acknowledgement Lease to
-the expected Ready manager Pod UID or Ready zeistd Pod on the selected Node;
-for a zeistd target it also re-resolves that Node and requires its UID to match
-the durable target snapshot, preventing a replacement Node with the same name
-from satisfying old evidence.
+the expected Ready consumer Pod UID and, for node-local targets, also requires
+the Pod to be scheduled on the selected Node with the expected UID. This
+prevents a replacement Node with the same name from satisfying old evidence.
 The isolated acknowledgement namespace prevents those workloads from reading
 issuer state. A compromise of a consumer ServiceAccount remains a compromise
 of that consumer's activation evidence and must be handled as a control-plane

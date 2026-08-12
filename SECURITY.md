@@ -13,8 +13,8 @@ unredacted Secret contents, access tokens, or production endpoint details.
 
 We will acknowledge a report, assess its impact, and coordinate a fix and
 disclosure timeline with the reporter. If the repository has not enabled
-private reporting, use the Zeist organization’s established private security
-contact rather than opening a public issue.
+private reporting, use an established private maintainer contact rather than
+opening a public issue.
 
 ## Supported versions
 

@@ -17,26 +17,26 @@ The configuration has a small fixed catalog of trust-domain profiles:
 - `webhook` issues a server-authentication leaf for an admission webhook and
   discovers the webhook configurations that reference its exact Service.
 - `mtls` issues the shared server-authentication and controller
-  client-authentication leaves used by the Zeist runner boundary. Its
+  client-authentication leaves used by a private service boundary. Its
   Kubernetes integration discovers eligible Node `InternalIP` values.
 
 The minimal v0.1 shape is:
 
 ```yaml
 apiVersion: pki.zeist.io/v1alpha1
-namespace: zeist-engine-system
-acknowledgementNamespace: zeist-engine-system
+namespace: platform-system
+acknowledgementNamespace: pki-acknowledgements
 webhook:
-  service: zeist-engine-webhook-service
-  secret: zeist-engine-webhook-server-cert
-  canaryService: zeist-engine-webhook-rotation-canary
-  canarySecret: zeist-engine-webhook-rotation-canary-cert
-  canaryConfiguration: zeist-engine-pki-rotation-canary
+  service: platform-webhook
+  secret: platform-webhook-tls
+  canaryService: platform-webhook-rotation-canary
+  canarySecret: platform-webhook-rotation-canary-tls
+  canaryConfiguration: platform-pki-rotation-canary
 mtls:
-  serverSecret: zeistd-server-tls
-  clientSecret: zeistd-controller-client-tls
+  serverSecret: platform-server-tls
+  clientSecret: platform-client-tls
   nodeSelector:
-    zeist.io/firecracker-capable: "true"
+    platform.example.io/private-tls: "true"
   port: 10443
 ```
 
@@ -45,7 +45,11 @@ short-lived consumer acknowledgement Leases when a deployment has a dedicated
 control namespace. The issuer ServiceAccount needs the corresponding narrowly
 scoped Lease permissions in that namespace.
 
-The webhook canary names are required for the Zeist integration. They name a
+A runnable, generic version of this configuration is available at
+[`examples/kubernetes/pki.yaml`](../examples/kubernetes/pki.yaml). It contains
+no credentials, private keys, or product-specific resource names.
+
+The webhook canary names are required for the included webhook rollover flow. They name a
 separate TLS endpoint and a narrowly matched `ValidatingWebhookConfiguration`.
 During a root rollover the normal webhook configurations receive dual trust,
 while the canary configuration receives the candidate root *only*. The canary
@@ -83,22 +87,21 @@ integration supplies `StateStore`, `Locker`, `Publisher`, `Discoverer`, and
 `Verifier` to the portable `rotation` package; it does not use this
 Kubernetes-specific YAML configuration.
 
-## Zeist Kubernetes configuration
+## Kubernetes output contracts
 
-[`examples/zeist/pki.yaml`](../examples/zeist/pki.yaml) is the compatibility
-configuration for issue #96. It keeps the current output Secret names and keys:
+The configuration chooses the output Secret names. The built-in profiles use
+the following data keys:
 
 | Trust domain | Secret | Data keys |
 | --- | --- | --- |
-| Webhook | `zeist-engine-webhook-server-cert` | `tls.crt`, `tls.key` |
-| Webhook rollover canary | `zeist-engine-webhook-rotation-canary-cert` | `tls.crt`, `tls.key` |
-| Runner server | `zeistd-server-tls` | `tls.crt`, `tls.key`, `ca.crt` |
-| Runner client | `zeistd-controller-client-tls` | `tls.crt`, `tls.key`, `ca.crt` |
+| Webhook | configured `webhook.secret` | `tls.crt`, `tls.key` |
+| Webhook rollover canary | configured `webhook.canarySecret` | `tls.crt`, `tls.key` |
+| mTLS server | configured `mtls.serverSecret` | `tls.crt`, `tls.key`, `ca.crt` |
+| mTLS client | configured `mtls.clientSecret` | `tls.crt`, `tls.key`, `ca.crt` |
 
-The runner server’s SAN set is the canonical union of `InternalIP` values from
-Nodes selected by `zeist.io/firecracker-capable=true`. Changing that inventory
-causes the next reconciliation to plan and, when applicable, publish a fresh
-server leaf.
+The mTLS server’s SAN set is the canonical union of `InternalIP` values from
+the selected Nodes. Changing that inventory causes the next reconciliation to
+plan and, when applicable, publish a fresh server leaf.
 
 The webhook and runner trust domains have independent roots. Routine leaf
 renewal reuses the active root. A root rollover is a staged, stateful operation
