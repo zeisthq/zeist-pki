@@ -208,7 +208,13 @@ func TestEnvtestDiscoveryAndVerifierUseCurrentNodePodAndLeaseEvidence(t *testing
 		}
 	}
 
-	acknowledgements, err := (Verifier{Client: envtestClient, Names: names}).Verify(ctx, request)
+	acknowledgements, err := (Verifier{
+		Client: envtestClient,
+		Names:  names,
+		Probe: func(context.Context, rotation.VerificationRequest) error {
+			return nil
+		},
+	}).Verify(ctx, request)
 	if err != nil {
 		t.Fatalf("verify current acknowledgement evidence: %v", err)
 	}
@@ -272,7 +278,7 @@ func TestEnvtestPublisherWritesSecretsAndNamedWebhookConfigurations(t *testing.T
 	if err != nil {
 		t.Fatalf("get canary webhook Secret: %v", err)
 	}
-	if canarySecret.Type != corev1.SecretTypeTLS || !bytes.Equal(canarySecret.Data["tls.crt"], []byte("canary-cert")) || canarySecret.Annotations[annotationLeafFingerprint] != "canary-leaf" {
+	if canarySecret.Type != corev1.SecretTypeTLS || !bytes.Equal(canarySecret.Data["tls.crt"], []byte("canary-cert")) || canarySecret.Annotations[annotationLeafFingerprint] != canonicalTestFingerprint("canary-leaf") {
 		t.Fatalf("published canary Secret = %#v", canarySecret)
 	}
 	mutating, err := envtestClient.AdmissionregistrationV1().MutatingWebhookConfigurations().Get(ctx, productionName, metav1.GetOptions{})
