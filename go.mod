@@ -13,8 +13,6 @@ require (
 	sigs.k8s.io/controller-runtime v0.24.0
 )
 
-replace github.com/zeisthq/zeist-pki/contract => ./contract
-
 require (
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
