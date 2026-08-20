@@ -218,8 +218,8 @@ func TestEnvtestDiscoveryAndVerifierUseCurrentNodePodAndLeaseEvidence(t *testing
 	if err != nil {
 		t.Fatalf("verify current acknowledgement evidence: %v", err)
 	}
-	if len(acknowledgements) != 2 {
-		t.Fatalf("acknowledgements = %#v, want manager and node evidence", acknowledgements)
+	if len(acknowledgements) != 3 {
+		t.Fatalf("acknowledgements = %#v, want manager, node, and probe evidence", acknowledgements)
 	}
 }
 
