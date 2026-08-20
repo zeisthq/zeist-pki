@@ -277,6 +277,9 @@ func (r Reconciler) verify(ctx context.Context, domain Domain, loaded VersionedS
 	}
 	if !targetsEqual(state.Targets, currentTargets) {
 		if serviceTargetRefreshAllowed(domain, state) {
+			if err := validateTargetSnapshot(currentTargets); err != nil {
+				return r.block(ctx, domain, loaded, fmt.Sprintf("discover current targets: %v", err))
+			}
 			state.Targets = copyTargets(currentTargets)
 			state.Acknowledgements = nil
 			state.BlockedFrom = ""
@@ -454,7 +457,7 @@ func (r Reconciler) overlap(ctx context.Context, domain Domain, loaded Versioned
 	}
 	if !targetsEqual(state.Targets, currentTargets) {
 		if serviceTargetRefreshAllowed(domain, state) {
-			return r.refreshServiceTargets(ctx, domain, loaded, PhaseOverlap)
+			return r.refreshServiceTargets(ctx, domain, loaded, PhaseAwaitingCandidateActivation)
 		}
 		return r.restartRolloverForTargets(ctx, domain, loaded)
 	}
