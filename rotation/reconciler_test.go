@@ -359,6 +359,46 @@ func TestReconcilerRefreshesServiceTargetsWithoutReissuingLeaves(t *testing.T) {
 	}
 }
 
+func TestReconcilerRefreshesServiceTargetDuringDualTrustActivation(t *testing.T) {
+	now := time.Date(2043, time.March, 14, 15, 9, 26, 0, time.UTC)
+	domain := testDomain()
+	domain.Name = "service"
+	domain.Profile = ProfileServiceMTLS
+	state := testStableState(domain, now)
+	candidate := Root{Fingerprint: "candidate-root", NotAfter: now.Add(domain.Policy.RootValidity)}
+	state.Phase = PhaseAwaitingCandidateActivation
+	state.Candidate = &candidate
+	state.DesiredGeneration = 2
+	state.PublishedGeneration = 2
+	state.PublishedDualTrust = true
+	state.PublishedMaterials = map[string]MaterialFingerprint{
+		"default": {LeafFingerprint: "candidate-leaf", TrustFingerprint: "dual-trust"},
+	}
+	state.Targets = []Target{{ID: "pod:server:old"}}
+	h := newRotationHarness(now, &state)
+	h.domain = domain
+	h.discoverer.targets = []Target{{ID: "pod:server:new"}}
+
+	refreshed, err := h.reconciler.Apply(context.Background(), h.domain)
+	if err != nil {
+		t.Fatalf("candidate target refresh Apply() error = %v", err)
+	}
+	if refreshed.State.Phase != PhaseAwaitingCandidateActivation || refreshed.State.DesiredGeneration != 2 || refreshed.State.PublishedGeneration != 2 {
+		t.Fatalf("refreshed state = %#v, want same candidate publication awaiting proof", refreshed.State)
+	}
+	if len(h.issuer.issues) != 0 || len(h.publisher.publications) != 0 {
+		t.Fatalf("candidate target refresh issued=%d published=%d, want no new material", len(h.issuer.issues), len(h.publisher.publications))
+	}
+
+	verified, err := h.reconciler.Apply(context.Background(), h.domain)
+	if err != nil {
+		t.Fatalf("candidate target refresh verification error = %v", err)
+	}
+	if verified.State.Phase != PhaseOverlap || verified.State.AcknowledgedGeneration != 2 {
+		t.Fatalf("verified state = %#v, want overlap with generation 2 acknowledged", verified.State)
+	}
+}
+
 func TestReconcilerRejectsDuplicateDiscoveredTargetsBeforeIssuance(t *testing.T) {
 	now := time.Date(2043, time.March, 14, 15, 9, 26, 0, time.UTC)
 	domain := testDomain()

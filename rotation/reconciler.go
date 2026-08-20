@@ -87,8 +87,8 @@ func (r Reconciler) Apply(ctx context.Context, domain Domain) (result Result, er
 			return Result{}, fmt.Errorf("discover %q current targets: %w", domain.Name, err)
 		}
 		if changed {
-			if domain.Profile == ProfileServiceMTLS && state.Candidate == nil && state.PublishedGeneration == state.DesiredGeneration && state.PublishedGeneration != 0 {
-				return r.refreshActiveTargets(ctx, domain, loaded)
+			if serviceTargetRefreshAllowed(domain, state) && state.Candidate == nil && state.PublishedGeneration == state.DesiredGeneration {
+				return r.refreshServiceTargets(ctx, domain, loaded, PhaseAwaitingCandidateActivation)
 			}
 			return r.issueLeaves(ctx, domain, loaded, state.Active, false, PhaseAwaitingCandidateActivation)
 		}
@@ -123,6 +123,9 @@ func (r Reconciler) Apply(ctx context.Context, domain Domain) (result Result, er
 			return Result{}, fmt.Errorf("discover candidate activation targets: %w", err)
 		}
 		if changed {
+			if serviceTargetRefreshAllowed(domain, state) {
+				return r.refreshServiceTargets(ctx, domain, loaded, PhaseAwaitingDualTrust)
+			}
 			return r.restartRolloverForTargets(ctx, domain, loaded)
 		}
 		return r.issueLeaves(ctx, domain, loaded, *state.Candidate, true, PhaseAwaitingCandidateActivation)
@@ -273,12 +276,14 @@ func (r Reconciler) verify(ctx context.Context, domain Domain, loaded VersionedS
 		return r.block(ctx, domain, loaded, fmt.Sprintf("discover current targets: %v", err))
 	}
 	if !targetsEqual(state.Targets, currentTargets) {
-		if domain.Profile == ProfileServiceMTLS && state.Candidate == nil && state.PublishedGeneration != 0 {
+		if serviceTargetRefreshAllowed(domain, state) {
 			state.Targets = copyTargets(currentTargets)
 			state.Acknowledgements = nil
-			state.Phase = PhaseAwaitingCandidateActivation
 			state.BlockedFrom = ""
 			state.BlockedReason = ""
+			if state.Candidate == nil {
+				state.Phase = PhaseAwaitingCandidateActivation
+			}
 			return r.persist(ctx, domain, VersionedState{State: state, Version: loaded.Version})
 		}
 		state.Targets = copyTargets(currentTargets)
@@ -330,13 +335,14 @@ func (r Reconciler) verify(ctx context.Context, domain Domain, loaded VersionedS
 	return r.persist(ctx, domain, VersionedState{State: state, Version: loaded.Version})
 }
 
-// refreshActiveTargets fences the acknowledgement quorum to the current
+// refreshServiceTargets fences the acknowledgement quorum to the current
 // Ready service Pods without reissuing service identity material. A Pod
 // replacement has a new UID, but the service DNS identity and certificate
 // remain unchanged; requiring a fresh leaf here would make every manual
-// rollout trigger another rollout indefinitely. Root-rollover target changes
-// still use the stricter dual-trust restart path above.
-func (r Reconciler) refreshActiveTargets(ctx context.Context, domain Domain, loaded VersionedState) (Result, error) {
+// rollout trigger another rollout indefinitely. Candidate-only retirement
+// deliberately does not use this path: a newly selected consumer must prove
+// the full dual-trust handoff before destructive trust removal.
+func (r Reconciler) refreshServiceTargets(ctx context.Context, domain Domain, loaded VersionedState, phase Phase) (Result, error) {
 	targets, err := r.Discoverer.Discover(ctx, domain)
 	if err != nil {
 		return Result{}, fmt.Errorf("discover %q active targets: %w", domain.Name, err)
@@ -347,10 +353,14 @@ func (r Reconciler) refreshActiveTargets(ctx context.Context, domain Domain, loa
 	state := loaded.State
 	state.Targets = copyTargets(targets)
 	state.Acknowledgements = nil
-	state.Phase = PhaseAwaitingCandidateActivation
+	state.Phase = phase
 	state.BlockedFrom = ""
 	state.BlockedReason = ""
 	return r.persist(ctx, domain, VersionedState{State: state, Version: loaded.Version})
+}
+
+func serviceTargetRefreshAllowed(domain Domain, state State) bool {
+	return domain.Profile == ProfileServiceMTLS && state.PublishedGeneration != 0 && (state.Candidate == nil || state.PublishedDualTrust)
 }
 
 func (r Reconciler) retire(ctx context.Context, domain Domain, loaded VersionedState) (Result, error) {
