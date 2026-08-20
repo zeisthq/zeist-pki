@@ -93,6 +93,12 @@ Portable rotation integrations implement `StateStore`, `Locker`, `Publisher`,
 `Discoverer`, and `Verifier`. The Kubernetes implementation is one adapter;
 another cloud-native system can provide its own without importing Kubernetes.
 
+Consumers can pin the contract without inheriting issuer dependencies:
+
+```console
+go get github.com/zeisthq/zeist-pki/contract/v1@v1.0.0
+```
+
 ## Operations and security
 
 Read [Configuration](docs/configuration.md) before preparing a deployment.
