@@ -87,6 +87,9 @@ func (r Reconciler) Apply(ctx context.Context, domain Domain) (result Result, er
 			return Result{}, fmt.Errorf("discover %q current targets: %w", domain.Name, err)
 		}
 		if changed {
+			if serviceTargetRefreshAllowed(domain, state) && state.Candidate == nil && state.PublishedGeneration == state.DesiredGeneration {
+				return r.refreshServiceTargets(ctx, domain, loaded, PhaseAwaitingCandidateActivation)
+			}
 			return r.issueLeaves(ctx, domain, loaded, state.Active, false, PhaseAwaitingCandidateActivation)
 		}
 		if contains(plan.Actions, ActionRenewLeaves) {
@@ -120,6 +123,9 @@ func (r Reconciler) Apply(ctx context.Context, domain Domain) (result Result, er
 			return Result{}, fmt.Errorf("discover candidate activation targets: %w", err)
 		}
 		if changed {
+			if serviceTargetRefreshAllowed(domain, state) {
+				return r.refreshServiceTargets(ctx, domain, loaded, PhaseAwaitingDualTrust)
+			}
 			return r.restartRolloverForTargets(ctx, domain, loaded)
 		}
 		return r.issueLeaves(ctx, domain, loaded, *state.Candidate, true, PhaseAwaitingCandidateActivation)
@@ -270,6 +276,19 @@ func (r Reconciler) verify(ctx context.Context, domain Domain, loaded VersionedS
 		return r.block(ctx, domain, loaded, fmt.Sprintf("discover current targets: %v", err))
 	}
 	if !targetsEqual(state.Targets, currentTargets) {
+		if serviceTargetRefreshAllowed(domain, state) {
+			if err := validateTargetSnapshot(currentTargets); err != nil {
+				return r.block(ctx, domain, loaded, fmt.Sprintf("discover current targets: %v", err))
+			}
+			state.Targets = copyTargets(currentTargets)
+			state.Acknowledgements = nil
+			state.BlockedFrom = ""
+			state.BlockedReason = ""
+			if state.Candidate == nil {
+				state.Phase = PhaseAwaitingCandidateActivation
+			}
+			return r.persist(ctx, domain, VersionedState{State: state, Version: loaded.Version})
+		}
 		state.Targets = copyTargets(currentTargets)
 		state.DesiredGeneration++
 		state.OperationID = newOperationID()
@@ -319,6 +338,35 @@ func (r Reconciler) verify(ctx context.Context, domain Domain, loaded VersionedS
 	return r.persist(ctx, domain, VersionedState{State: state, Version: loaded.Version})
 }
 
+// refreshServiceTargets fences the acknowledgement quorum to the current
+// Ready service Pods without reissuing service identity material. A Pod
+// replacement has a new UID, but the service DNS identity and certificate
+// remain unchanged; requiring a fresh leaf here would make every manual
+// rollout trigger another rollout indefinitely. Candidate-only service
+// publication is still fenced by an exact acknowledgement of the current
+// candidate material; other profiles retain their stricter target-change
+// restart behavior.
+func (r Reconciler) refreshServiceTargets(ctx context.Context, domain Domain, loaded VersionedState, phase Phase) (Result, error) {
+	targets, err := r.Discoverer.Discover(ctx, domain)
+	if err != nil {
+		return Result{}, fmt.Errorf("discover %q active targets: %w", domain.Name, err)
+	}
+	if err := validateTargetSnapshot(targets); err != nil {
+		return Result{}, fmt.Errorf("discover %q active targets: %w", domain.Name, err)
+	}
+	state := loaded.State
+	state.Targets = copyTargets(targets)
+	state.Acknowledgements = nil
+	state.Phase = phase
+	state.BlockedFrom = ""
+	state.BlockedReason = ""
+	return r.persist(ctx, domain, VersionedState{State: state, Version: loaded.Version})
+}
+
+func serviceTargetRefreshAllowed(domain Domain, state State) bool {
+	return domain.Profile == ProfileServiceMTLS && state.PublishedGeneration != 0
+}
+
 func (r Reconciler) retire(ctx context.Context, domain Domain, loaded VersionedState) (Result, error) {
 	state := loaded.State
 	if state.Candidate == nil {
@@ -329,13 +377,16 @@ func (r Reconciler) retire(ctx context.Context, domain Domain, loaded VersionedS
 		return r.block(ctx, domain, loaded, fmt.Sprintf("discover retirement targets: %v", err))
 	}
 	if !targetsEqual(state.Targets, currentTargets) {
+		if serviceTargetRefreshAllowed(domain, state) {
+			return r.refreshServiceTargets(ctx, domain, loaded, PhaseRetiringActiveRoot)
+		}
 		return r.restartRolloverForTargets(ctx, domain, loaded)
 	}
 	if state.PublishedGeneration != state.DesiredGeneration {
 		// The exact target snapshot was dual-trust verified before this
-		// candidate-only intent was persisted. Do not rediscover targets in
-		// issueLeaves here: a newly appeared consumer has not proven dual trust
-		// and requires an entire safe rollover cycle instead.
+		// candidate-only intent was persisted. Service-mTLS target refreshes
+		// preserve that publication; other profiles require a fresh dual-trust
+		// cycle when their target snapshot changes.
 		return r.publish(ctx, domain, loaded, *state.Candidate, false, PhaseRetiringActiveRoot)
 	}
 	if state.PublishedDualTrust {
@@ -392,10 +443,9 @@ func (r Reconciler) retire(ctx context.Context, domain Domain, loaded VersionedS
 }
 
 // overlap holds both roots live until the required time boundary, while still
-// watching the selected consumer snapshot. A new consumer may only enter a
-// rollover through a fresh dual-trust and activation-proof sequence; it must
-// never inherit a candidate-only publication merely because it appeared after
-// the original snapshot was acknowledged.
+// watching the selected consumer snapshot. Service-mTLS Pod replacement can
+// refresh the exact acknowledgement quorum against the already dual-trust
+// publication; other target changes restart the rollover before retirement.
 func (r Reconciler) overlap(ctx context.Context, domain Domain, loaded VersionedState, plan Plan) (Result, error) {
 	state := loaded.State
 	if state.MinimumOverlapDeadline == nil {
@@ -406,6 +456,9 @@ func (r Reconciler) overlap(ctx context.Context, domain Domain, loaded Versioned
 		return r.block(ctx, domain, loaded, fmt.Sprintf("discover overlap targets: %v", err))
 	}
 	if !targetsEqual(state.Targets, currentTargets) {
+		if serviceTargetRefreshAllowed(domain, state) {
+			return r.refreshServiceTargets(ctx, domain, loaded, PhaseAwaitingCandidateActivation)
+		}
 		return r.restartRolloverForTargets(ctx, domain, loaded)
 	}
 	if r.now().Before(*state.MinimumOverlapDeadline) {

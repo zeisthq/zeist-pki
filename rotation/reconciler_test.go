@@ -325,6 +325,202 @@ func TestReconcilerTargetChangePersistsSnapshotBeforeReissuingLeaves(t *testing.
 	}
 }
 
+func TestReconcilerRefreshesServiceTargetsWithoutReissuingLeaves(t *testing.T) {
+	now := time.Date(2043, time.March, 14, 15, 9, 26, 0, time.UTC)
+	domain := testDomain()
+	domain.Name = "service"
+	domain.Profile = ProfileServiceMTLS
+	state := testStableState(domain, now)
+	state.Targets = []Target{{ID: "pod:server:old"}}
+	h := newRotationHarness(now, &state)
+	h.domain = domain
+	h.discoverer.targets = []Target{{ID: "pod:server:new"}}
+
+	refreshed, err := h.reconciler.Apply(context.Background(), h.domain)
+	if err != nil {
+		t.Fatalf("target refresh Apply() error = %v", err)
+	}
+	if refreshed.State.Phase != PhaseAwaitingCandidateActivation || refreshed.State.DesiredGeneration != 1 || refreshed.State.PublishedGeneration != 1 {
+		t.Fatalf("refreshed state = %#v, want same published generation awaiting target proof", refreshed.State)
+	}
+	if !reflect.DeepEqual(refreshed.State.Targets, h.discoverer.targets) {
+		t.Fatalf("refreshed targets = %#v, want %#v", refreshed.State.Targets, h.discoverer.targets)
+	}
+	if len(h.issuer.issues) != 0 || len(h.publisher.publications) != 0 {
+		t.Fatalf("service target refresh issued=%d published=%d, want no new material", len(h.issuer.issues), len(h.publisher.publications))
+	}
+
+	verified, err := h.reconciler.Apply(context.Background(), h.domain)
+	if err != nil {
+		t.Fatalf("target refresh verification error = %v", err)
+	}
+	if verified.State.Phase != PhaseStable || verified.State.AcknowledgedGeneration != 1 {
+		t.Fatalf("verified state = %#v, want stable acknowledged generation 1", verified.State)
+	}
+}
+
+func TestReconcilerRefreshesServiceTargetDuringDualTrustActivation(t *testing.T) {
+	now := time.Date(2043, time.March, 14, 15, 9, 26, 0, time.UTC)
+	domain := testDomain()
+	domain.Name = "service"
+	domain.Profile = ProfileServiceMTLS
+	state := testStableState(domain, now)
+	candidate := Root{Fingerprint: "candidate-root", NotAfter: now.Add(domain.Policy.RootValidity)}
+	state.Phase = PhaseAwaitingCandidateActivation
+	state.Candidate = &candidate
+	state.DesiredGeneration = 2
+	state.PublishedGeneration = 2
+	state.PublishedDualTrust = true
+	state.PublishedMaterials = map[string]MaterialFingerprint{
+		"default": {LeafFingerprint: "candidate-leaf", TrustFingerprint: "dual-trust"},
+	}
+	state.Targets = []Target{{ID: "pod:server:old"}}
+	h := newRotationHarness(now, &state)
+	h.domain = domain
+	h.discoverer.targets = []Target{{ID: "pod:server:new"}}
+
+	refreshed, err := h.reconciler.Apply(context.Background(), h.domain)
+	if err != nil {
+		t.Fatalf("candidate target refresh Apply() error = %v", err)
+	}
+	if refreshed.State.Phase != PhaseAwaitingCandidateActivation || refreshed.State.DesiredGeneration != 2 || refreshed.State.PublishedGeneration != 2 {
+		t.Fatalf("refreshed state = %#v, want same candidate publication awaiting proof", refreshed.State)
+	}
+	if len(h.issuer.issues) != 0 || len(h.publisher.publications) != 0 {
+		t.Fatalf("candidate target refresh issued=%d published=%d, want no new material", len(h.issuer.issues), len(h.publisher.publications))
+	}
+
+	verified, err := h.reconciler.Apply(context.Background(), h.domain)
+	if err != nil {
+		t.Fatalf("candidate target refresh verification error = %v", err)
+	}
+	if verified.State.Phase != PhaseOverlap || verified.State.AcknowledgedGeneration != 2 {
+		t.Fatalf("verified state = %#v, want overlap with generation 2 acknowledged", verified.State)
+	}
+}
+
+func TestReconcilerRefreshesServiceTargetDuringCandidateOnlyRetirement(t *testing.T) {
+	now := time.Date(2043, time.March, 14, 15, 9, 26, 0, time.UTC)
+	domain := testDomain()
+	domain.Name = "service"
+	domain.Profile = ProfileServiceMTLS
+	state := testStableState(domain, now)
+	candidate := Root{Fingerprint: "candidate-root", NotAfter: now.Add(domain.Policy.RootValidity)}
+	state.Phase = PhaseRetiringActiveRoot
+	state.Candidate = &candidate
+	state.DesiredGeneration = 2
+	state.PublishedGeneration = 2
+	state.PublishedDualTrust = false
+	state.PublishedMaterials = map[string]MaterialFingerprint{
+		"default": {LeafFingerprint: "candidate-leaf", TrustFingerprint: "candidate-trust"},
+	}
+	state.Targets = []Target{{ID: "pod:server:old"}}
+	h := newRotationHarness(now, &state)
+	h.domain = domain
+	h.discoverer.targets = []Target{{ID: "pod:server:new"}}
+
+	refreshed, err := h.reconciler.Apply(context.Background(), h.domain)
+	if err != nil {
+		t.Fatalf("candidate-only target refresh Apply() error = %v", err)
+	}
+	if refreshed.State.Phase != PhaseRetiringActiveRoot || refreshed.State.DesiredGeneration != 2 || refreshed.State.PublishedGeneration != 2 {
+		t.Fatalf("refreshed state = %#v, want same candidate-only publication", refreshed.State)
+	}
+	if len(h.issuer.issues) != 0 || len(h.publisher.publications) != 0 {
+		t.Fatalf("candidate-only target refresh issued=%d published=%d, want no new material", len(h.issuer.issues), len(h.publisher.publications))
+	}
+
+	verified, err := h.reconciler.Apply(context.Background(), h.domain)
+	if err != nil {
+		t.Fatalf("candidate-only target verification error = %v", err)
+	}
+	if verified.State.Phase != PhaseRetiringActiveRoot || !verified.State.RetirementAuthorized {
+		t.Fatalf("verified state = %#v, want authorized candidate-only retirement", verified.State)
+	}
+}
+
+func TestReconcilerBlocksInvalidServiceTargetsDuringVerification(t *testing.T) {
+	now := time.Date(2043, time.March, 14, 15, 9, 26, 0, time.UTC)
+	domain := testDomain()
+	domain.Name = "service"
+	domain.Profile = ProfileServiceMTLS
+
+	tests := []struct {
+		name    string
+		targets []Target
+		reason  string
+	}{
+		{name: "empty", reason: "no targets"},
+		{name: "duplicate", targets: []Target{{ID: "pod:new"}, {ID: "pod:new"}}, reason: "duplicate target ID"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			state := testStableState(domain, now)
+			state.Phase = PhaseAwaitingCandidateActivation
+			state.Targets = []Target{{ID: "pod:old"}}
+			h := newRotationHarness(now, &state)
+			h.domain = domain
+			h.discoverer.targets = tt.targets
+
+			result, err := h.reconciler.Apply(context.Background(), domain)
+			if err != nil {
+				t.Fatalf("Apply() error = %v", err)
+			}
+			if result.State.Phase != PhaseBlocked || result.State.BlockedFrom != PhaseAwaitingCandidateActivation || !strings.Contains(result.State.BlockedReason, tt.reason) {
+				t.Fatalf("blocked state = %#v, want verification block for %q", result.State, tt.reason)
+			}
+			if !reflect.DeepEqual(result.State.Targets, state.Targets) {
+				t.Fatalf("persisted targets = %#v, want original valid snapshot %#v", result.State.Targets, state.Targets)
+			}
+		})
+	}
+}
+
+func TestReconcilerReverifiesDualTrustAfterServiceTargetRefreshDuringOverlap(t *testing.T) {
+	now := time.Date(2043, time.March, 14, 15, 9, 26, 0, time.UTC)
+	domain := testDomain()
+	domain.Name = "service"
+	domain.Profile = ProfileServiceMTLS
+	state := testStableState(domain, now)
+	candidate := Root{Fingerprint: "candidate-root", NotAfter: now.Add(domain.Policy.RootValidity)}
+	deadline := now.Add(-time.Minute)
+	state.Phase = PhaseOverlap
+	state.Candidate = &candidate
+	state.DesiredGeneration = 2
+	state.PublishedGeneration = 2
+	state.PublishedDualTrust = true
+	state.PublishedMaterials = map[string]MaterialFingerprint{
+		"default": {LeafFingerprint: "candidate-leaf", TrustFingerprint: "dual-trust"},
+	}
+	state.Targets = []Target{{ID: "pod:old"}}
+	state.MinimumOverlapDeadline = &deadline
+	h := newRotationHarness(now, &state)
+	h.domain = domain
+	h.discoverer.targets = []Target{{ID: "pod:new"}}
+
+	refreshed, err := h.reconciler.Apply(context.Background(), domain)
+	if err != nil {
+		t.Fatalf("target refresh Apply() error = %v", err)
+	}
+	if refreshed.State.Phase != PhaseAwaitingCandidateActivation {
+		t.Fatalf("refreshed phase = %q, want candidate activation verification", refreshed.State.Phase)
+	}
+	if len(h.publisher.publications) != 0 {
+		t.Fatalf("publications = %d, want no candidate-only publication before proof", len(h.publisher.publications))
+	}
+
+	verified, err := h.reconciler.Apply(context.Background(), domain)
+	if err != nil {
+		t.Fatalf("dual-trust verification Apply() error = %v", err)
+	}
+	if verified.State.Phase != PhaseOverlap || verified.State.MinimumOverlapDeadline == nil || !verified.State.MinimumOverlapDeadline.After(now) {
+		t.Fatalf("verified state = %#v, want a renewed overlap deadline after dual-trust proof", verified.State)
+	}
+	if len(h.publisher.publications) != 0 {
+		t.Fatalf("publications = %d, want no candidate-only publication before renewed overlap", len(h.publisher.publications))
+	}
+}
+
 func TestReconcilerRejectsDuplicateDiscoveredTargetsBeforeIssuance(t *testing.T) {
 	now := time.Date(2043, time.March, 14, 15, 9, 26, 0, time.UTC)
 	domain := testDomain()
