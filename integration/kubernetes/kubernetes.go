@@ -604,7 +604,7 @@ type PublicationMaterial struct {
 	CanaryTrustBundle []byte
 }
 
-// Publisher atomically publishes fixed Zeist-compatible Secret outputs.
+// Publisher publishes fixed Zeist-compatible Secret outputs.
 type Publisher struct {
 	Client kubernetes.Interface
 	Names  Names
@@ -671,6 +671,30 @@ func (p Publisher) applySecret(ctx context.Context, namespace, name string, secr
 		return err
 	}
 	if err != nil {
+		return err
+	}
+	if !hasSecretMaterial(secret) && secret.Type != secretType {
+		// Kubernetes treats Secret.type as immutable. A fresh deployment may
+		// pre-create an empty, fixed-name Opaque placeholder so the issuer can
+		// use least-privilege RBAC, but the first real TLS publication must
+		// replace that placeholder with a typed Secret. Never perform this
+		// delete/create transition for an already fenced, owned object.
+		if hasPublicationAnnotations(secret.Annotations) || secret.Immutable != nil || len(secret.OwnerReferences) != 0 {
+			return fmt.Errorf("refusing to replace fenced or owned empty Secret %s", name)
+		}
+		replacement := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: name, Namespace: namespace,
+				Labels:      cloneStringMap(secret.Labels),
+				Annotations: mergeManagedAnnotations(secret.Annotations, annotations),
+			},
+			Type: secretType,
+			Data: cloneData(data),
+		}
+		if err := p.Client.CoreV1().Secrets(namespace).Delete(ctx, name, metav1.DeleteOptions{}); err != nil {
+			return err
+		}
+		_, err := p.Client.CoreV1().Secrets(namespace).Create(ctx, replacement, metav1.CreateOptions{})
 		return err
 	}
 	if hasSecretMaterial(secret) {
@@ -766,6 +790,18 @@ func managedAnnotationsMatch(existing, managed map[string]string) bool {
 	return true
 }
 
+func hasPublicationAnnotations(annotations map[string]string) bool {
+	for _, key := range []string{
+		annotationDomain, annotationGeneration, annotationOperation,
+		annotationLeafFingerprint, annotationTrustFingerprint,
+	} {
+		if annotations[key] != "" {
+			return true
+		}
+	}
+	return false
+}
+
 func mergeManagedAnnotations(existing, managed map[string]string) map[string]string {
 	merged := make(map[string]string, len(existing)+len(managed))
 	for key, value := range existing {
@@ -789,6 +825,17 @@ func cloneData(data map[string][]byte) map[string][]byte {
 	copy := make(map[string][]byte, len(data))
 	for key, value := range data {
 		copy[key] = append([]byte(nil), value...)
+	}
+	return copy
+}
+
+func cloneStringMap(values map[string]string) map[string]string {
+	if len(values) == 0 {
+		return nil
+	}
+	copy := make(map[string]string, len(values))
+	for key, value := range values {
+		copy[key] = value
 	}
 	return copy
 }

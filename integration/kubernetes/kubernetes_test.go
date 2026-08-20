@@ -189,6 +189,65 @@ func TestPublisherPreservesUnmanagedAnnotationsOnIdempotentReplay(t *testing.T) 
 	if secret.Annotations["external.example/audit"] != "keep" {
 		t.Fatalf("unmanaged annotation lost: %#v", secret.Annotations)
 	}
+	if secret.Type != corev1.SecretTypeTLS {
+		t.Fatalf("placeholder type = %q, want %q", secret.Type, corev1.SecretTypeTLS)
+	}
+}
+
+func TestPublisherReplacesEmptyOpaquePlaceholder(t *testing.T) {
+	client := fake.NewSimpleClientset(&corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "server", Namespace: "system",
+			Labels: map[string]string{"pki.zeist.io/output": "mtls-server"},
+		},
+		Type: corev1.SecretTypeOpaque,
+	})
+	publisher := Publisher{Client: client, Names: Names{Namespace: "system", ServerSecret: "server"}}
+	publication := rotation.Publication{
+		Domain: "mtls", Generation: 1, OperationID: "operation",
+		Materials: map[string]rotation.MaterialFingerprint{"server": {LeafFingerprint: "leaf", TrustFingerprint: "trust"}},
+		Opaque:    &PublicationMaterial{ServerTLS: map[string][]byte{"tls.crt": []byte("cert"), "tls.key": []byte("key"), "ca.crt": []byte("trust")}},
+	}
+	if err := publisher.applySecret(context.Background(), "system", "server", corev1.SecretTypeTLS, publication.Opaque.(*PublicationMaterial).ServerTLS, publication, "server"); err != nil {
+		t.Fatal(err)
+	}
+	secret, err := client.CoreV1().Secrets("system").Get(context.Background(), "server", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if secret.Type != corev1.SecretTypeTLS || string(secret.Data["tls.crt"]) != "cert" || secret.Labels["pki.zeist.io/output"] != "mtls-server" {
+		t.Fatalf("published placeholder = %#v", secret)
+	}
+	var deleted, created bool
+	for _, action := range client.Actions() {
+		if action.GetVerb() == "delete" && action.GetResource().Resource == "secrets" {
+			deleted = true
+		}
+		if action.GetVerb() == "create" && action.GetResource().Resource == "secrets" {
+			created = true
+		}
+	}
+	if !deleted || !created {
+		t.Fatalf("placeholder actions = %#v, want delete followed by create", client.Actions())
+	}
+}
+
+func TestPublisherRefusesFencedEmptyPlaceholder(t *testing.T) {
+	client := fake.NewSimpleClientset(&corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "server", Namespace: "system",
+			Annotations: map[string]string{annotationDomain: "mtls"},
+		},
+		Type: corev1.SecretTypeOpaque,
+	})
+	publisher := Publisher{Client: client, Names: Names{Namespace: "system", ServerSecret: "server"}}
+	publication := rotation.Publication{
+		Domain: "mtls", Generation: 1, OperationID: "operation",
+		Materials: map[string]rotation.MaterialFingerprint{"server": {LeafFingerprint: "leaf", TrustFingerprint: "trust"}},
+	}
+	if err := publisher.applySecret(context.Background(), "system", "server", corev1.SecretTypeTLS, map[string][]byte{"tls.crt": []byte("cert"), "tls.key": []byte("key")}, publication, "server"); err == nil {
+		t.Fatal("publisher replaced a fenced empty placeholder")
+	}
 }
 
 func TestPublisherRecoveryRefusesForeignCanarySecret(t *testing.T) {
