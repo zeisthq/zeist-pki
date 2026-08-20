@@ -87,6 +87,9 @@ func (r Reconciler) Apply(ctx context.Context, domain Domain) (result Result, er
 			return Result{}, fmt.Errorf("discover %q current targets: %w", domain.Name, err)
 		}
 		if changed {
+			if domain.Profile == ProfileServiceMTLS && state.Candidate == nil && state.PublishedGeneration == state.DesiredGeneration && state.PublishedGeneration != 0 {
+				return r.refreshActiveTargets(ctx, domain, loaded)
+			}
 			return r.issueLeaves(ctx, domain, loaded, state.Active, false, PhaseAwaitingCandidateActivation)
 		}
 		if contains(plan.Actions, ActionRenewLeaves) {
@@ -270,6 +273,14 @@ func (r Reconciler) verify(ctx context.Context, domain Domain, loaded VersionedS
 		return r.block(ctx, domain, loaded, fmt.Sprintf("discover current targets: %v", err))
 	}
 	if !targetsEqual(state.Targets, currentTargets) {
+		if domain.Profile == ProfileServiceMTLS && state.Candidate == nil && state.PublishedGeneration != 0 {
+			state.Targets = copyTargets(currentTargets)
+			state.Acknowledgements = nil
+			state.Phase = PhaseAwaitingCandidateActivation
+			state.BlockedFrom = ""
+			state.BlockedReason = ""
+			return r.persist(ctx, domain, VersionedState{State: state, Version: loaded.Version})
+		}
 		state.Targets = copyTargets(currentTargets)
 		state.DesiredGeneration++
 		state.OperationID = newOperationID()
@@ -316,6 +327,29 @@ func (r Reconciler) verify(ctx context.Context, domain Domain, loaded VersionedS
 		deadline := r.now().Add(domain.Policy.MinimumTrustOverlap)
 		state.MinimumOverlapDeadline = &deadline
 	}
+	return r.persist(ctx, domain, VersionedState{State: state, Version: loaded.Version})
+}
+
+// refreshActiveTargets fences the acknowledgement quorum to the current
+// Ready service Pods without reissuing service identity material. A Pod
+// replacement has a new UID, but the service DNS identity and certificate
+// remain unchanged; requiring a fresh leaf here would make every manual
+// rollout trigger another rollout indefinitely. Root-rollover target changes
+// still use the stricter dual-trust restart path above.
+func (r Reconciler) refreshActiveTargets(ctx context.Context, domain Domain, loaded VersionedState) (Result, error) {
+	targets, err := r.Discoverer.Discover(ctx, domain)
+	if err != nil {
+		return Result{}, fmt.Errorf("discover %q active targets: %w", domain.Name, err)
+	}
+	if err := validateTargetSnapshot(targets); err != nil {
+		return Result{}, fmt.Errorf("discover %q active targets: %w", domain.Name, err)
+	}
+	state := loaded.State
+	state.Targets = copyTargets(targets)
+	state.Acknowledgements = nil
+	state.Phase = PhaseAwaitingCandidateActivation
+	state.BlockedFrom = ""
+	state.BlockedReason = ""
 	return r.persist(ctx, domain, VersionedState{State: state, Version: loaded.Version})
 }
 
