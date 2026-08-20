@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net"
 	"sort"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -22,7 +23,7 @@ import (
 
 // Issuer owns the self-managed private roots held in a StateStore Secret. It
 // is intentionally not an arbitrary issuer framework: it implements only the
-// two fixed Zeist profiles and keeps root keys out of consumer output Secrets.
+// the built-in profiles and keeps root keys out of consumer output Secrets.
 type Issuer struct {
 	Client kubernetes.Interface
 	Names  Names
@@ -46,7 +47,7 @@ func (i Issuer) now() time.Time {
 // material. Empty fixed-name placeholders are intentionally allowed so a
 // least-privilege deployment can pre-create them.
 func (i Issuer) GuardBootstrap(ctx context.Context, domain rotation.Domain) error {
-	if domain.Name == "webhook" {
+	if domain.Profile == rotation.ProfileWebhook {
 		if err := i.Names.validateWebhookCanary(); err != nil {
 			return err
 		}
@@ -63,8 +64,12 @@ func (i Issuer) GuardBootstrap(ctx context.Context, domain rotation.Domain) erro
 	if err == nil && hasSecretMaterial(stateSecret) {
 		return fmt.Errorf("issuer state Secret %s retains authority material; run guarded recover", stateSecret.Name)
 	}
-	for _, name := range i.outputNames(domain.Name) {
-		secret, err := i.Client.CoreV1().Secrets(i.Names.Namespace).Get(ctx, name, metav1.GetOptions{})
+	outputs, err := i.outputSecrets(domain)
+	if err != nil {
+		return err
+	}
+	for _, output := range outputs {
+		secret, err := i.Client.CoreV1().Secrets(output.namespace).Get(ctx, output.name, metav1.GetOptions{})
 		if apierrors.IsNotFound(err) {
 			continue
 		}
@@ -72,7 +77,7 @@ func (i Issuer) GuardBootstrap(ctx context.Context, domain rotation.Domain) erro
 			return err
 		}
 		if hasSecretMaterial(secret) {
-			return fmt.Errorf("issuer state is missing while managed output Secret %s survives; run guarded recover", name)
+			return fmt.Errorf("issuer state is missing while managed output Secret %s/%s survives; run guarded recover", output.namespace, output.name)
 		}
 	}
 	return nil
@@ -143,7 +148,7 @@ func (i Issuer) CreateRoot(_ context.Context, domain rotation.Domain) (rotation.
 // after publication, existing outputs bearing that exact operation identity
 // are parsed and reused instead of minting a different leaf generation.
 func (i Issuer) Issue(ctx context.Context, request rotation.IssueRequest) (rotation.Publication, error) {
-	if request.Domain.Name == "webhook" {
+	if request.Domain.Profile == rotation.ProfileWebhook {
 		if err := i.Names.validateWebhookCanary(); err != nil {
 			return rotation.Publication{}, err
 		}
@@ -171,8 +176,8 @@ func (i Issuer) Issue(ctx context.Context, request rotation.IssueRequest) (rotat
 	material := PublicationMaterial{TrustBundle: trustBundle}
 	publication := rotation.Publication{Materials: make(map[string]rotation.MaterialFingerprint)}
 	var leafExpiry time.Time
-	switch request.Domain.Name {
-	case "webhook":
+	switch request.Domain.Profile {
+	case rotation.ProfileWebhook:
 		data, fingerprint, notAfter, err := i.webhookOutput(ctx, request, signer, trustCertificates, trustFingerprint)
 		if err != nil {
 			return rotation.Publication{}, err
@@ -198,7 +203,7 @@ func (i Issuer) Issue(ctx context.Context, request rotation.IssueRequest) (rotat
 		if canaryNotAfter.Before(leafExpiry) {
 			leafExpiry = canaryNotAfter
 		}
-	case "mtls":
+	case rotation.ProfileMTLS:
 		server, serverFingerprint, serverExpiry, err := i.serverOutput(ctx, request, signer, trustCertificates, trustBundle, trustFingerprint)
 		if err != nil {
 			return rotation.Publication{}, err
@@ -214,8 +219,28 @@ func (i Issuer) Issue(ctx context.Context, request rotation.IssueRequest) (rotat
 		if clientExpiry.Before(leafExpiry) {
 			leafExpiry = clientExpiry
 		}
+	case rotation.ProfileServiceMTLS:
+		configured, err := i.Names.serviceMTLS(request.Domain.Name)
+		if err != nil {
+			return rotation.Publication{}, err
+		}
+		server, serverFingerprint, serverExpiry, err := i.serviceServerOutput(ctx, request, configured, signer, trustCertificates, trustBundle, trustFingerprint)
+		if err != nil {
+			return rotation.Publication{}, err
+		}
+		client, clientFingerprint, clientExpiry, err := i.serviceClientOutput(ctx, request, configured, signer, trustCertificates, trustBundle, trustFingerprint)
+		if err != nil {
+			return rotation.Publication{}, err
+		}
+		material.ServerTLS, material.ClientTLS = server, client
+		publication.Materials["server"] = rotation.MaterialFingerprint{LeafFingerprint: serverFingerprint, TrustFingerprint: trustFingerprint}
+		publication.Materials["client"] = rotation.MaterialFingerprint{LeafFingerprint: clientFingerprint, TrustFingerprint: trustFingerprint}
+		leafExpiry = serverExpiry
+		if clientExpiry.Before(leafExpiry) {
+			leafExpiry = clientExpiry
+		}
 	default:
-		return rotation.Publication{}, fmt.Errorf("unsupported domain %q", request.Domain.Name)
+		return rotation.Publication{}, fmt.Errorf("unsupported domain profile %q", request.Domain.Profile)
 	}
 	publication.LeafNotAfter = leafExpiry
 	publication.Opaque = &material
@@ -251,9 +276,9 @@ func containsRootFingerprint(roots []rotation.Root, fingerprint string) bool {
 // fingerprint-confirmed recovery of a root whose private key is unavailable.
 func (i Issuer) reuseExistingLeaves(ctx context.Context, request rotation.IssueRequest, roots []*x509.Certificate, trustBundle []byte, trustFingerprint string) (rotation.Publication, error) {
 	publication := rotation.Publication{Materials: make(map[string]rotation.MaterialFingerprint)}
-	switch request.Domain.Name {
-	case "webhook":
-		data, fingerprint, notAfter, err := i.reuseExistingOutput(ctx, i.Names.WebhookSecret, pki.ProfileWebhook, roots, nil)
+	switch request.Domain.Profile {
+	case rotation.ProfileWebhook:
+		data, fingerprint, notAfter, err := i.reuseExistingOutput(ctx, i.Names.Namespace, i.Names.WebhookSecret, pki.ProfileWebhook, roots, nil)
 		if err != nil {
 			return rotation.Publication{}, err
 		}
@@ -277,12 +302,37 @@ func (i Issuer) reuseExistingLeaves(ctx context.Context, request rotation.IssueR
 		}
 		publication.Opaque = &PublicationMaterial{WebhookTLS: data, WebhookCanaryTLS: canary, TrustBundle: trustBundle, CanaryTrustBundle: canaryTrustBundle}
 		return publication, nil
-	case "mtls":
-		server, serverFingerprint, serverExpiry, err := i.reuseExistingOutput(ctx, i.Names.ServerSecret, pki.ProfileServer, roots, trustBundle)
+	case rotation.ProfileMTLS:
+		server, serverFingerprint, serverExpiry, err := i.reuseExistingOutput(ctx, i.Names.Namespace, i.Names.ServerSecret, pki.ProfileServer, roots, trustBundle)
 		if err != nil {
 			return rotation.Publication{}, err
 		}
-		client, clientFingerprint, clientExpiry, err := i.reuseExistingOutput(ctx, i.Names.ClientSecret, pki.ProfileClient, roots, trustBundle)
+		client, clientFingerprint, clientExpiry, err := i.reuseExistingOutput(ctx, i.Names.Namespace, i.Names.ClientSecret, pki.ProfileClient, roots, trustBundle)
+		if err != nil {
+			return rotation.Publication{}, err
+		}
+		leafExpiry := serverExpiry
+		if clientExpiry.Before(leafExpiry) {
+			leafExpiry = clientExpiry
+		}
+		publication.Materials["server"] = rotation.MaterialFingerprint{LeafFingerprint: serverFingerprint, TrustFingerprint: trustFingerprint}
+		publication.Materials["client"] = rotation.MaterialFingerprint{LeafFingerprint: clientFingerprint, TrustFingerprint: trustFingerprint}
+		publication.LeafNotAfter = leafExpiry
+		publication.Opaque = &PublicationMaterial{ServerTLS: server, ClientTLS: client, TrustBundle: trustBundle}
+		return publication, nil
+	case rotation.ProfileServiceMTLS:
+		configured, err := i.Names.serviceMTLS(request.Domain.Name)
+		if err != nil {
+			return rotation.Publication{}, err
+		}
+		server, serverFingerprint, serverExpiry, err := i.reuseExistingOutput(ctx, configured.ServerNamespace, configured.ServerSecret, pki.ProfileServer, roots, trustBundle)
+		if err != nil {
+			return rotation.Publication{}, err
+		}
+		if err := validateServiceCertificateIdentity(server["tls.crt"], configured); err != nil {
+			return rotation.Publication{}, fmt.Errorf("validate surviving service server identity: %w", err)
+		}
+		client, clientFingerprint, clientExpiry, err := i.reuseExistingOutput(ctx, configured.ClientNamespace, configured.ClientSecret, pki.ProfileClient, roots, trustBundle)
 		if err != nil {
 			return rotation.Publication{}, err
 		}
@@ -296,7 +346,7 @@ func (i Issuer) reuseExistingLeaves(ctx context.Context, request rotation.IssueR
 		publication.Opaque = &PublicationMaterial{ServerTLS: server, ClientTLS: client, TrustBundle: trustBundle}
 		return publication, nil
 	default:
-		return rotation.Publication{}, fmt.Errorf("unsupported domain %q", request.Domain.Name)
+		return rotation.Publication{}, fmt.Errorf("unsupported domain profile %q", request.Domain.Profile)
 	}
 }
 
@@ -332,7 +382,7 @@ func (i Issuer) webhookCanaryOutput(ctx context.Context, request rotation.IssueR
 }
 
 func (i Issuer) webhookOutputFor(ctx context.Context, name, service string, request rotation.IssueRequest, signer *pki.RootMaterial, roots []*x509.Certificate, trustFingerprint string) (map[string][]byte, string, time.Time, error) {
-	if data, fingerprint, notAfter, found, err := i.existingOutput(ctx, name, request, pki.ProfileWebhook, roots, nil, trustFingerprint); err != nil || found {
+	if data, fingerprint, notAfter, found, err := i.existingOutput(ctx, i.Names.Namespace, name, request, pki.ProfileWebhook, roots, nil, trustFingerprint); err != nil || found {
 		if err == nil && found {
 			leaf, parseErr := pki.ParseLeafPEM(data["tls.crt"], data["tls.key"])
 			if parseErr != nil {
@@ -398,7 +448,7 @@ func canaryTrustMaterial(signer *pki.RootMaterial) ([]byte, string, []*x509.Cert
 }
 
 func (i Issuer) serverOutput(ctx context.Context, request rotation.IssueRequest, signer *pki.RootMaterial, roots []*x509.Certificate, trustBundle []byte, trustFingerprint string) (map[string][]byte, string, time.Time, error) {
-	if data, fingerprint, notAfter, found, err := i.existingOutput(ctx, i.Names.ServerSecret, request, pki.ProfileServer, roots, trustBundle, trustFingerprint); err != nil || found {
+	if data, fingerprint, notAfter, found, err := i.existingOutput(ctx, i.Names.Namespace, i.Names.ServerSecret, request, pki.ProfileServer, roots, trustBundle, trustFingerprint); err != nil || found {
 		return data, fingerprint, notAfter, err
 	}
 	service := i.Names.RunnerService
@@ -414,10 +464,57 @@ func (i Issuer) serverOutput(ctx context.Context, request rotation.IssueRequest,
 }
 
 func (i Issuer) clientOutput(ctx context.Context, request rotation.IssueRequest, signer *pki.RootMaterial, roots []*x509.Certificate, trustBundle []byte, trustFingerprint string) (map[string][]byte, string, time.Time, error) {
-	if data, fingerprint, notAfter, found, err := i.existingOutput(ctx, i.Names.ClientSecret, request, pki.ProfileClient, roots, trustBundle, trustFingerprint); err != nil || found {
+	if data, fingerprint, notAfter, found, err := i.existingOutput(ctx, i.Names.Namespace, i.Names.ClientSecret, request, pki.ProfileClient, roots, trustBundle, trustFingerprint); err != nil || found {
 		return data, fingerprint, notAfter, err
 	}
 	return issueOutput(signer, pki.LeafOptions{CommonName: "zeist-controller", Profile: pki.ProfileClient, Validity: request.Domain.Policy.LeafValidity, Now: i.now()}, trustBundle, trustFingerprint)
+}
+
+func (i Issuer) serviceServerOutput(ctx context.Context, request rotation.IssueRequest, configured ServiceMTLSNames, signer *pki.RootMaterial, roots []*x509.Certificate, trustBundle []byte, trustFingerprint string) (map[string][]byte, string, time.Time, error) {
+	if data, fingerprint, notAfter, found, err := i.existingOutput(ctx, configured.ServerNamespace, configured.ServerSecret, request, pki.ProfileServer, roots, trustBundle, trustFingerprint); err != nil || found {
+		if err == nil && found {
+			if identityErr := validateServiceCertificateIdentity(data["tls.crt"], configured); identityErr != nil {
+				return nil, "", time.Time{}, fmt.Errorf("validate existing service server identity: %w", identityErr)
+			}
+		}
+		return data, fingerprint, notAfter, err
+	}
+	shortName, longName := serviceDNSNames(configured)
+	return issueOutput(signer, pki.LeafOptions{
+		CommonName: shortName, Profile: pki.ProfileServer, DNSNames: []string{shortName, longName},
+		Validity: request.Domain.Policy.LeafValidity, Now: i.now(),
+	}, trustBundle, trustFingerprint)
+}
+
+func (i Issuer) serviceClientOutput(ctx context.Context, request rotation.IssueRequest, configured ServiceMTLSNames, signer *pki.RootMaterial, roots []*x509.Certificate, trustBundle []byte, trustFingerprint string) (map[string][]byte, string, time.Time, error) {
+	if data, fingerprint, notAfter, found, err := i.existingOutput(ctx, configured.ClientNamespace, configured.ClientSecret, request, pki.ProfileClient, roots, trustBundle, trustFingerprint); err != nil || found {
+		return data, fingerprint, notAfter, err
+	}
+	return issueOutput(signer, pki.LeafOptions{
+		CommonName: request.Domain.Name + " client", Profile: pki.ProfileClient,
+		Validity: request.Domain.Policy.LeafValidity, Now: i.now(),
+	}, trustBundle, trustFingerprint)
+}
+
+func serviceDNSNames(configured ServiceMTLSNames) (string, string) {
+	shortName := configured.ServerService + "." + configured.ServerNamespace + ".svc"
+	clusterDomain := strings.Trim(configured.ClusterDomain, ".")
+	if clusterDomain == "" {
+		clusterDomain = "cluster.local"
+	}
+	return shortName, shortName + "." + clusterDomain
+}
+
+func validateServiceCertificateIdentity(certificatePEM []byte, configured ServiceMTLSNames) error {
+	certificate, err := pki.ParseCertificatePEM(certificatePEM)
+	if err != nil {
+		return err
+	}
+	shortName, _ := serviceDNSNames(configured)
+	if err := certificate.VerifyHostname(shortName); err != nil {
+		return fmt.Errorf("certificate does not identify %s: %w", shortName, err)
+	}
+	return nil
 }
 
 func issueOutput(signer *pki.RootMaterial, options pki.LeafOptions, trustBundle []byte, trustFingerprint string) (map[string][]byte, string, time.Time, error) {
@@ -432,8 +529,8 @@ func issueOutput(signer *pki.RootMaterial, options pki.LeafOptions, trustBundle 
 	return data, certificateFingerprint(leaf.Certificate), leaf.Certificate.NotAfter, nil
 }
 
-func (i Issuer) existingOutput(ctx context.Context, name string, request rotation.IssueRequest, profile pki.Profile, roots []*x509.Certificate, trustBundle []byte, trustFingerprint string) (map[string][]byte, string, time.Time, bool, error) {
-	secret, err := i.Client.CoreV1().Secrets(i.Names.Namespace).Get(ctx, name, metav1.GetOptions{})
+func (i Issuer) existingOutput(ctx context.Context, namespace, name string, request rotation.IssueRequest, profile pki.Profile, roots []*x509.Certificate, trustBundle []byte, trustFingerprint string) (map[string][]byte, string, time.Time, bool, error) {
+	secret, err := i.Client.CoreV1().Secrets(namespace).Get(ctx, name, metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
 		return nil, "", time.Time{}, false, nil
 	}
@@ -470,8 +567,8 @@ func (i Issuer) existingOutput(ctx context.Context, name string, request rotatio
 	return cloneData(secret.Data), fingerprint, leaf.Certificate.NotAfter, true, nil
 }
 
-func (i Issuer) reuseExistingOutput(ctx context.Context, name string, profile pki.Profile, roots []*x509.Certificate, trustBundle []byte) (map[string][]byte, string, time.Time, error) {
-	secret, err := i.Client.CoreV1().Secrets(i.Names.Namespace).Get(ctx, name, metav1.GetOptions{})
+func (i Issuer) reuseExistingOutput(ctx context.Context, namespace, name string, profile pki.Profile, roots []*x509.Certificate, trustBundle []byte) (map[string][]byte, string, time.Time, error) {
+	secret, err := i.Client.CoreV1().Secrets(namespace).Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
 		return nil, "", time.Time{}, fmt.Errorf("read surviving output Secret %s: %w", name, err)
 	}
@@ -489,14 +586,25 @@ func (i Issuer) reuseExistingOutput(ctx context.Context, name string, profile pk
 	return data, certificateFingerprint(leaf.Certificate), leaf.Certificate.NotAfter, nil
 }
 
-func (i Issuer) outputNames(domain string) []string {
-	switch domain {
-	case "webhook":
-		return []string{i.Names.WebhookSecret, i.Names.WebhookCanarySecret}
-	case "mtls":
-		return []string{i.Names.ServerSecret, i.Names.ClientSecret}
+type namespacedSecret struct {
+	namespace string
+	name      string
+}
+
+func (i Issuer) outputSecrets(domain rotation.Domain) ([]namespacedSecret, error) {
+	switch domain.Profile {
+	case rotation.ProfileWebhook:
+		return []namespacedSecret{{i.Names.Namespace, i.Names.WebhookSecret}, {i.Names.Namespace, i.Names.WebhookCanarySecret}}, nil
+	case rotation.ProfileMTLS:
+		return []namespacedSecret{{i.Names.Namespace, i.Names.ServerSecret}, {i.Names.Namespace, i.Names.ClientSecret}}, nil
+	case rotation.ProfileServiceMTLS:
+		configured, err := i.Names.serviceMTLS(domain.Name)
+		if err != nil {
+			return nil, err
+		}
+		return []namespacedSecret{{configured.ServerNamespace, configured.ServerSecret}, {configured.ClientNamespace, configured.ClientSecret}}, nil
 	default:
-		return nil
+		return nil, fmt.Errorf("unsupported domain profile %q", domain.Profile)
 	}
 }
 

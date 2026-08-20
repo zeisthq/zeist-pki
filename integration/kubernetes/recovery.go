@@ -71,7 +71,7 @@ func (r Recoverer) Recover(ctx context.Context, domain rotation.Domain, confirme
 	if lockErr := recoveryLockError(domain.Name, contextLock); lockErr != nil {
 		return rotation.Result{}, lockErr
 	}
-	if domain.Name == "webhook" {
+	if domain.Profile == rotation.ProfileWebhook {
 		if err := r.Names.validateWebhookCanary(); err != nil {
 			return rotation.Result{}, err
 		}
@@ -132,8 +132,8 @@ func recoveryLockError(domain string, lock rotation.ContextLock) error {
 
 func (r Recoverer) survivingDomain(ctx context.Context, domain rotation.Domain, confirmed string) (rotation.Root, uint64, time.Time, error) {
 	now := r.now()
-	switch domain.Name {
-	case "webhook":
+	switch domain.Profile {
+	case rotation.ProfileWebhook:
 		secret, err := r.Client.CoreV1().Secrets(r.Names.Namespace).Get(ctx, r.Names.WebhookSecret, metav1.GetOptions{})
 		if err != nil {
 			return rotation.Root{}, 0, time.Time{}, fmt.Errorf("read webhook output: %w", err)
@@ -209,7 +209,7 @@ func (r Recoverer) survivingDomain(ctx context.Context, domain rotation.Domain, 
 			return rotation.Root{}, 0, time.Time{}, fmt.Errorf("webhook output fencing is inconsistent: %w", evidenceErr)
 		}
 		return active.root, generation, leafNotAfter, nil
-	case "mtls":
+	case rotation.ProfileMTLS:
 		server, err := r.Client.CoreV1().Secrets(r.Names.Namespace).Get(ctx, r.Names.ServerSecret, metav1.GetOptions{})
 		if err != nil {
 			return rotation.Root{}, 0, time.Time{}, fmt.Errorf("read server output: %w", err)
@@ -271,9 +271,82 @@ func (r Recoverer) survivingDomain(ctx context.Context, domain rotation.Domain, 
 			leafNotAfter = clientLeaf.Certificate.NotAfter
 		}
 		return active.root, generation, leafNotAfter, nil
+	case rotation.ProfileServiceMTLS:
+		configured, err := r.Names.serviceMTLS(domain.Name)
+		if err != nil {
+			return rotation.Root{}, 0, time.Time{}, err
+		}
+		return r.survivingServiceMTLS(ctx, domain, confirmed, configured, now)
 	default:
-		return rotation.Root{}, 0, time.Time{}, fmt.Errorf("unsupported domain %q", domain.Name)
+		return rotation.Root{}, 0, time.Time{}, fmt.Errorf("unsupported domain profile %q", domain.Profile)
 	}
+}
+
+func (r Recoverer) survivingServiceMTLS(ctx context.Context, domain rotation.Domain, confirmed string, configured ServiceMTLSNames, now time.Time) (rotation.Root, uint64, time.Time, error) {
+	server, err := r.Client.CoreV1().Secrets(configured.ServerNamespace).Get(ctx, configured.ServerSecret, metav1.GetOptions{})
+	if err != nil {
+		return rotation.Root{}, 0, time.Time{}, fmt.Errorf("read service server output: %w", err)
+	}
+	client, err := r.Client.CoreV1().Secrets(configured.ClientNamespace).Get(ctx, configured.ClientSecret, metav1.GetOptions{})
+	if err != nil {
+		return rotation.Root{}, 0, time.Time{}, fmt.Errorf("read service client output: %w", err)
+	}
+	serverRoots, err := pki.ParseCertificatesPEM(server.Data["ca.crt"])
+	if err != nil {
+		return rotation.Root{}, 0, time.Time{}, fmt.Errorf("parse service server trust bundle: %w", err)
+	}
+	clientRoots, err := pki.ParseCertificatesPEM(client.Data["ca.crt"])
+	if err != nil {
+		return rotation.Root{}, 0, time.Time{}, fmt.Errorf("parse service client trust bundle: %w", err)
+	}
+	if err := validateSurvivingTrustRoots(serverRoots, now); err != nil {
+		return rotation.Root{}, 0, time.Time{}, fmt.Errorf("surviving service server trust root is invalid: %w", err)
+	}
+	if err := validateSurvivingTrustRoots(clientRoots, now); err != nil {
+		return rotation.Root{}, 0, time.Time{}, fmt.Errorf("surviving service client trust root is invalid: %w", err)
+	}
+	if bundleFingerprint(serverRoots) != bundleFingerprint(clientRoots) {
+		return rotation.Root{}, 0, time.Time{}, fmt.Errorf("service server and client surviving trust bundles differ")
+	}
+	active, err := confirmedPublicRoot(serverRoots, confirmed)
+	if err != nil {
+		return rotation.Root{}, 0, time.Time{}, err
+	}
+	serverLeaf, err := pki.ParseLeafPEM(server.Data["tls.crt"], server.Data["tls.key"])
+	if err != nil {
+		return rotation.Root{}, 0, time.Time{}, fmt.Errorf("parse service server output: %w", err)
+	}
+	clientLeaf, err := pki.ParseLeafPEM(client.Data["tls.crt"], client.Data["tls.key"])
+	if err != nil {
+		return rotation.Root{}, 0, time.Time{}, fmt.Errorf("parse service client output: %w", err)
+	}
+	if err := pki.ValidateLeaf(serverLeaf, serverRoots, pki.ProfileServer, now); err != nil || serverLeaf.Certificate.CheckSignatureFrom(active.certificate) != nil {
+		return rotation.Root{}, 0, time.Time{}, fmt.Errorf("service server output is not signed by the confirmed root")
+	}
+	if err := validateServiceCertificateIdentity(server.Data["tls.crt"], configured); err != nil {
+		return rotation.Root{}, 0, time.Time{}, fmt.Errorf("validate service server identity: %w", err)
+	}
+	if err := pki.ValidateLeaf(clientLeaf, clientRoots, pki.ProfileClient, now); err != nil || clientLeaf.Certificate.CheckSignatureFrom(active.certificate) != nil {
+		return rotation.Root{}, 0, time.Time{}, fmt.Errorf("service client output is not signed by the confirmed root")
+	}
+	trustFingerprint := bundleFingerprint(serverRoots)
+	serverEvidence, err := recoveryOutputEvidence(server, domain.Name, certificateFingerprint(serverLeaf.Certificate), trustFingerprint)
+	if err != nil {
+		return rotation.Root{}, 0, time.Time{}, fmt.Errorf("validate service server output fencing: %w", err)
+	}
+	clientEvidence, err := recoveryOutputEvidence(client, domain.Name, certificateFingerprint(clientLeaf.Certificate), trustFingerprint)
+	if err != nil {
+		return rotation.Root{}, 0, time.Time{}, fmt.Errorf("validate service client output fencing: %w", err)
+	}
+	generation, err := consistentRecoveryEvidence(serverEvidence, clientEvidence)
+	if err != nil {
+		return rotation.Root{}, 0, time.Time{}, fmt.Errorf("service mTLS output fencing is inconsistent: %w", err)
+	}
+	leafNotAfter := serverLeaf.Certificate.NotAfter
+	if clientLeaf.Certificate.NotAfter.Before(leafNotAfter) {
+		leafNotAfter = clientLeaf.Certificate.NotAfter
+	}
+	return active.root, generation, leafNotAfter, nil
 }
 
 // validateSurvivingTrustRoots rejects any root that would make recovery adopt

@@ -84,6 +84,8 @@ The portable API is demonstrated by
   SANs, and fingerprints.
 - `rotation` owns versioned configuration and state, deterministic plans,
   replay-safe phases, and activation evidence.
+- `contract/v1` defines dependency-free publication and acknowledgement wire
+  values for certificate consumers.
 - `integration/kubernetes` implements Kubernetes-backed state, fencing,
   discovery, publication, and verification.
 

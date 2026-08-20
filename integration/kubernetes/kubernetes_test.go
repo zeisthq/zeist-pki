@@ -2,6 +2,8 @@ package kubernetes
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"testing"
 	"time"
@@ -51,8 +53,8 @@ func TestStateStoreFencesConflictingWrites(t *testing.T) {
 func TestDiscovererUsesCurrentSelectedNodeIPs(t *testing.T) {
 	client := fake.NewSimpleClientset(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node", UID: "uid", Labels: map[string]string{"zeist.io/firecracker-capable": "true"}}, Status: corev1.NodeStatus{Addresses: []corev1.NodeAddress{{Type: corev1.NodeInternalIP, Address: "10.0.0.9"}}}})
 	discoverer := Discoverer{Client: client, Names: Names{NodeSelector: map[string]string{"zeist.io/firecracker-capable": "true"}}}
-	targets, err := discoverer.Discover(context.Background(), rotation.Domain{Name: "mtls"})
-	if err != nil || len(targets) != 1 || targets[0].Evidence["internalIP"] != "10.0.0.9" {
+	targets, err := discoverer.Discover(context.Background(), rotation.Domain{Name: "mtls", Profile: rotation.ProfileMTLS})
+	if err != nil || len(targets) != 2 || targets[0].Evidence["internalIP"] != "10.0.0.9" || targets[1].Evidence["probeOnly"] != "true" {
 		t.Fatalf("targets = %#v, %v", targets, err)
 	}
 	if got := targets[0].Evidence["port"]; got != "10443" {
@@ -65,19 +67,19 @@ func TestDiscovererIncludesEveryReadyWebhookManager(t *testing.T) {
 		readyAcknowledgementPod("ready-manager", "ready-uid", "", map[string]string{"app": "manager"}),
 		&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "not-ready-manager", Namespace: "system", UID: types.UID("not-ready-uid"), Labels: map[string]string{"app": "manager"}}},
 	)
-	discoverer := Discoverer{Client: client, Names: Names{Namespace: "system", WebhookService: "webhook", ManagerPodSelector: "app=manager"}}
-	targets, err := discoverer.Discover(context.Background(), rotation.Domain{Name: "webhook"})
+	discoverer := Discoverer{Client: client, Names: Names{Namespace: "system", WebhookService: "webhook", WebhookPodSelector: "app=manager"}}
+	targets, err := discoverer.Discover(context.Background(), rotation.Domain{Name: "webhook", Profile: rotation.ProfileWebhook})
 	if err != nil {
 		t.Fatalf("Discover() error = %v", err)
 	}
 	if len(targets) != 2 {
 		t.Fatalf("Discover() targets = %#v, want API-server plus one Ready manager", targets)
 	}
-	if targets[0].ID != "apiserver:webhook" || targets[0].Evidence["probeOnly"] != "true" {
-		t.Fatalf("Discover() probe target = %#v", targets[0])
+	if targets[0].ID != "manager:ready-uid" || targets[0].Evidence["role"] != "webhook" {
+		t.Fatalf("Discover() manager target = %#v", targets[0])
 	}
-	if targets[1].ID != "manager:ready-uid" || targets[1].Evidence["role"] != "webhook" {
-		t.Fatalf("Discover() manager target = %#v", targets[1])
+	if targets[1].ID != "probe:webhook:" || targets[1].Evidence["probeOnly"] != "true" {
+		t.Fatalf("Discover() probe target = %#v", targets[1])
 	}
 }
 
@@ -174,10 +176,10 @@ func TestPublisherPreservesUnmanagedAnnotationsOnIdempotentReplay(t *testing.T) 
 		Opaque:    &PublicationMaterial{ServerTLS: map[string][]byte{"tls.crt": []byte("cert"), "tls.key": []byte("key"), "ca.crt": []byte("trust")}},
 	}
 	data := publication.Opaque.(*PublicationMaterial).ServerTLS
-	if err := publisher.applySecret(context.Background(), "server", corev1.SecretTypeTLS, data, publication, "server"); err != nil {
+	if err := publisher.applySecret(context.Background(), "system", "server", corev1.SecretTypeTLS, data, publication, "server"); err != nil {
 		t.Fatal(err)
 	}
-	if err := publisher.applySecret(context.Background(), "server", corev1.SecretTypeTLS, data, publication, "server"); err != nil {
+	if err := publisher.applySecret(context.Background(), "system", "server", corev1.SecretTypeTLS, data, publication, "server"); err != nil {
 		t.Fatalf("idempotent replay: %v", err)
 	}
 	secret, err := client.CoreV1().Secrets("system").Get(context.Background(), "server", metav1.GetOptions{})
@@ -200,14 +202,14 @@ func TestPublisherRecoveryRefusesForeignCanarySecret(t *testing.T) {
 		Domain: "webhook", Generation: 2, OperationID: "recover", AdoptExisting: true,
 		Materials: map[string]rotation.MaterialFingerprint{"canary": {LeafFingerprint: "leaf", TrustFingerprint: "trust"}},
 	}
-	if err := publisher.applySecret(context.Background(), "canary", corev1.SecretTypeTLS, map[string][]byte{"tls.crt": []byte("new-cert"), "tls.key": []byte("new-key")}, publication, "canary"); err == nil {
+	if err := publisher.applySecret(context.Background(), "system", "canary", corev1.SecretTypeTLS, map[string][]byte{"tls.crt": []byte("new-cert"), "tls.key": []byte("new-key")}, publication, "canary"); err == nil {
 		t.Fatal("recovery overwrote a foreign managed canary Secret")
 	}
 }
 
 func TestVerifierRejectsExpiredAcknowledgementLease(t *testing.T) {
 	now := time.Now().UTC()
-	payload, err := EncodeAcknowledgement(AcknowledgementLeaseData{Generation: 1, LeafFingerprint: "leaf", TrustFingerprint: "trust"})
+	payload, err := EncodeAcknowledgement(AcknowledgementLeaseData{Generation: 1, LeafFingerprint: canonicalTestFingerprint("leaf"), TrustFingerprint: canonicalTestFingerprint("trust")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -219,7 +221,7 @@ func TestVerifierRejectsExpiredAcknowledgementLease(t *testing.T) {
 		Spec:       coordinationv1.LeaseSpec{HolderIdentity: &holder, LeaseDurationSeconds: &duration, RenewTime: &expiredAt},
 	})
 	verifier := Verifier{Client: client, Names: Names{Namespace: "system", AcknowledgementNamespace: "acks"}}
-	request := rotation.VerificationRequest{Domain: rotation.Domain{Name: "mtls"}, Generation: 1, Targets: []rotation.Target{{ID: "manager:pod", Evidence: map[string]string{"role": "client"}}}, Publication: rotation.Publication{Materials: map[string]rotation.MaterialFingerprint{"client": {LeafFingerprint: "leaf", TrustFingerprint: "trust"}}}}
+	request := rotation.VerificationRequest{Domain: rotation.Domain{Name: "mtls"}, Generation: 1, Targets: []rotation.Target{{ID: "manager:pod", Evidence: map[string]string{"role": "client"}}}, Publication: rotation.Publication{Materials: map[string]rotation.MaterialFingerprint{"client": {LeafFingerprint: canonicalTestFingerprint("leaf"), TrustFingerprint: canonicalTestFingerprint("trust")}}}}
 	if _, err := verifier.Verify(context.Background(), request); err == nil {
 		t.Fatal("Verifier accepted an expired acknowledgement Lease")
 	}
@@ -262,7 +264,7 @@ func TestVerifierRejectsForgedManagerAcknowledgement(t *testing.T) {
 
 func TestVerifierAcceptsReadyManagerWebhookAcknowledgement(t *testing.T) {
 	target := rotation.Target{ID: "manager:manager-uid", Evidence: map[string]string{"role": "webhook"}}
-	material := rotation.MaterialFingerprint{LeafFingerprint: "webhook-leaf", TrustFingerprint: "webhook-trust"}
+	material := rotation.MaterialFingerprint{LeafFingerprint: canonicalTestFingerprint("webhook-leaf"), TrustFingerprint: canonicalTestFingerprint("webhook-trust")}
 	request := rotation.VerificationRequest{
 		Domain:     rotation.Domain{Name: "webhook"},
 		Generation: 7,
@@ -328,8 +330,8 @@ func acknowledgementVerificationRequest(targets ...rotation.Target) rotation.Ver
 		Generation: 7,
 		Targets:    targets,
 		Publication: rotation.Publication{Materials: map[string]rotation.MaterialFingerprint{
-			"client": {LeafFingerprint: "client-leaf", TrustFingerprint: "client-trust"},
-			"server": {LeafFingerprint: "server-leaf", TrustFingerprint: "server-trust"},
+			"client": {LeafFingerprint: canonicalTestFingerprint("client-leaf"), TrustFingerprint: canonicalTestFingerprint("client-trust")},
+			"server": {LeafFingerprint: canonicalTestFingerprint("server-leaf"), TrustFingerprint: canonicalTestFingerprint("server-trust")},
 		}},
 	}
 }
@@ -378,7 +380,7 @@ func readyAcknowledgementPod(name, uid, nodeName string, labels map[string]strin
 }
 
 func TestAcknowledgementLeaseDataUsesNumericGeneration(t *testing.T) {
-	data, err := EncodeAcknowledgement(AcknowledgementLeaseData{Generation: 42, LeafFingerprint: "leaf", TrustFingerprint: "trust"})
+	data, err := EncodeAcknowledgement(AcknowledgementLeaseData{Generation: 42, LeafFingerprint: canonicalTestFingerprint("leaf"), TrustFingerprint: canonicalTestFingerprint("trust")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -389,4 +391,9 @@ func TestAcknowledgementLeaseDataUsesNumericGeneration(t *testing.T) {
 	if decoded["generation"] != float64(42) {
 		t.Fatalf("generation JSON type/value = %#v, want numeric 42", decoded["generation"])
 	}
+}
+
+func canonicalTestFingerprint(seed string) string {
+	sum := sha256.Sum256([]byte(seed))
+	return "sha256:" + hex.EncodeToString(sum[:])
 }

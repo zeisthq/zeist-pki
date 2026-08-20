@@ -5,12 +5,10 @@ a Kubernetes API and not a certificate CRD. A common configuration names only
 the environment-specific values that cannot be safely discovered; secure
 certificate and rollover policy defaults are built in.
 
-The current document version is `pki.zeist.io/v1alpha1`. Version 0.1 has two
-built-in, independently managed domains: `webhook` and `mtls`. The top-level
-configuration identifies the target namespace, optionally names the namespace
-holding consumer acknowledgement Leases, and supplies profile-specific settings
-for those domains. Output and issuer-state contracts are fixed by the profile,
-not made arbitrary configuration.
+The current document version is `pki.zeist.io/v1alpha1`. It has two platform
+domains and an optional service-mTLS list. Each domain has an independent root.
+The top-level configuration identifies the issuer namespace. It can also name
+the namespace that holds consumer acknowledgement Leases.
 
 The configuration has a small fixed catalog of trust-domain profiles:
 
@@ -19,8 +17,10 @@ The configuration has a small fixed catalog of trust-domain profiles:
 - `mtls` issues the shared server-authentication and controller
   client-authentication leaves used by a private service boundary. Its
   Kubernetes integration discovers eligible Node `InternalIP` values.
+- `serviceMTLS` issues one server leaf and one client leaf for a Kubernetes
+  Service. It discovers every current Ready server and client Pod.
 
-The minimal v0.1 shape is:
+The minimal v0.2 shape is:
 
 ```yaml
 apiVersion: pki.zeist.io/v1alpha1
@@ -32,12 +32,38 @@ webhook:
   canaryService: platform-webhook-rotation-canary
   canarySecret: platform-webhook-rotation-canary-tls
   canaryConfiguration: platform-pki-rotation-canary
+  podSelector:
+    app.example.io/name: platform-manager
+  configurationNames:
+    - platform-mutating-webhooks
+    - platform-validating-webhooks
+  canaryResourcePath: /apis/platform.example.io/v1/widgets/platform-pki-rotation-canary
+  canaryAnnotation: pki.example.io/rotation-canary
 mtls:
   serverSecret: platform-server-tls
   clientSecret: platform-client-tls
+  service: platform-runner
   nodeSelector:
     platform.example.io/private-tls: "true"
+  clientPodSelector:
+    app.example.io/name: platform-manager
+  serverPodSelector:
+    app.example.io/name: platform-runner
   port: 10443
+serviceMTLS:
+  - name: internal-api
+    server:
+      namespace: platform-system
+      service: internal-api
+      secret: internal-api-server-tls
+      podSelector:
+        pki.example.io/internal-api-role: server
+      port: 8443
+    client:
+      namespace: application-system
+      secret: internal-api-client-tls
+      podSelector:
+        pki.example.io/internal-api-role: client
 ```
 
 `acknowledgementNamespace` is optional and defaults to `namespace`. It isolates
@@ -48,6 +74,10 @@ scoped Lease permissions in that namespace.
 A runnable, generic version of this configuration is available at
 [`examples/kubernetes/pki.yaml`](../examples/kubernetes/pki.yaml). It contains
 no credentials, private keys, or product-specific resource names.
+
+The webhook fields contain all platform-specific selectors and resource names.
+The canary resource path names one pre-created object. The probe gets this
+object and changes only the configured annotation in a dry-run update.
 
 The webhook canary names are required for the included webhook rollover flow. They name a
 separate TLS endpoint and a narrowly matched `ValidatingWebhookConfiguration`.
@@ -60,7 +90,7 @@ control planes it must list every HTTPS API-server origin that must prove the
 new trust.
 
 An optional top-level `policy` map overrides the duration fields for both
-built-in domains: `rootValidity`, `rootRolloverBefore`, `leafValidity`,
+platform domains and each service domain: `rootValidity`, `rootRolloverBefore`, `leafValidity`,
 `leafRenewBefore`, `minimumTrustOverlap`, and `clockSkew`. Omit it to use the
 safe defaults.
 
@@ -98,10 +128,22 @@ the following data keys:
 | Webhook rollover canary | configured `webhook.canarySecret` | `tls.crt`, `tls.key` |
 | mTLS server | configured `mtls.serverSecret` | `tls.crt`, `tls.key`, `ca.crt` |
 | mTLS client | configured `mtls.clientSecret` | `tls.crt`, `tls.key`, `ca.crt` |
+| Service mTLS server | configured `serviceMTLS[].server.secret` | `tls.crt`, `tls.key`, `ca.crt` |
+| Service mTLS client | configured `serviceMTLS[].client.secret` | `tls.crt`, `tls.key`, `ca.crt` |
 
 The mTLS server’s SAN set is the canonical union of `InternalIP` values from
 the selected Nodes. Changing that inventory causes the next reconciliation to
 plan and, when applicable, publish a fresh server leaf.
+
+A service-mTLS server leaf identifies both Service DNS forms. For the default
+cluster domain, these forms are `<service>.<namespace>.svc` and
+`<service>.<namespace>.svc.cluster.local`. Set `clusterDomain` only when the
+cluster uses another DNS suffix.
+
+Each Ready consumer uses its Pod UID as its exact target identity. The target
+IDs are `server:<pod-uid>` and `client:<pod-uid>`. A changed target set restarts
+the current proof phase. The live probe uses TLS 1.3 and the published client
+identity. It verifies the exact published server leaf.
 
 The webhook and runner trust domains have independent roots. Routine leaf
 renewal reuses the active root. A root rollover is a staged, stateful operation

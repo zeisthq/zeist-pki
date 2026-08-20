@@ -7,8 +7,6 @@ package kubernetes
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	contractv1 "github.com/zeisthq/zeist-pki/contract/v1"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -37,11 +36,11 @@ const (
 	candidateCAKey    = "candidate-ca.crt"
 	candidateCAKeyKey = "candidate-ca.key"
 
-	annotationDomain           = "pki.zeist.io/domain"
-	annotationGeneration       = "pki.zeist.io/generation"
-	annotationOperation        = "pki.zeist.io/operation-id"
-	annotationLeafFingerprint  = "pki.zeist.io/leaf-fingerprint"
-	annotationTrustFingerprint = "pki.zeist.io/trust-bundle-fingerprint"
+	annotationDomain           = contractv1.DomainAnnotation
+	annotationGeneration       = contractv1.GenerationAnnotation
+	annotationOperation        = contractv1.OperationAnnotation
+	annotationLeafFingerprint  = contractv1.LeafFingerprintAnnotation
+	annotationTrustFingerprint = contractv1.TrustFingerprintAnnotation
 )
 
 // Names defines the fixed Zeist v0.1 outputs owned by one integration.
@@ -55,22 +54,42 @@ type Names struct {
 	WebhookService             string
 	WebhookCanaryService       string
 	WebhookCanaryConfiguration string
+	WebhookCanaryResourcePath  string
+	WebhookCanaryAnnotation    string
 	// APIServerEndpoints is an optional explicit HA control-plane endpoint
 	// set. When supplied, the webhook canary must reach every HTTPS origin.
 	// An empty set uses the active client-go API-server endpoint.
 	APIServerEndpoints        []string
 	WebhookConfigurationNames []string
 	RunnerService             string
+	WebhookPodSelector        string
 	ManagerPodSelector        string
 	ZeistdPodSelector         string
 	NodeSelector              map[string]string
 	Port                      int32
+	ServiceMTLS               map[string]ServiceMTLSNames
 }
 
-const (
-	defaultManagerPodSelector = "app.kubernetes.io/name=zeist-engine,app.kubernetes.io/component=controller-manager"
-	defaultZeistdPodSelector  = "app.kubernetes.io/name=zeistd,app.kubernetes.io/component=firecracker-runner"
-)
+// ServiceMTLSNames binds one generic trust domain to Kubernetes resources.
+type ServiceMTLSNames struct {
+	ServerNamespace   string
+	ServerService     string
+	ServerSecret      string
+	ServerPodSelector string
+	ServerPort        int32
+	ClientNamespace   string
+	ClientSecret      string
+	ClientPodSelector string
+	ClusterDomain     string
+}
+
+func (n Names) serviceMTLS(domain string) (ServiceMTLSNames, error) {
+	configured, found := n.ServiceMTLS[domain]
+	if !found {
+		return ServiceMTLSNames{}, fmt.Errorf("service-mTLS domain %q is not configured", domain)
+	}
+	return configured, nil
+}
 
 // validateWebhookCanary keeps the candidate-root activation proof an atomic
 // integration contract: a partial canary configuration would otherwise let a
@@ -420,17 +439,17 @@ type Discoverer struct {
 
 // Discover implements rotation.Discoverer.
 func (d Discoverer) Discover(ctx context.Context, domain rotation.Domain) ([]rotation.Target, error) {
-	switch domain.Name {
-	case "webhook":
+	switch domain.Profile {
+	case rotation.ProfileWebhook:
 		// The API-server canary is necessary but not sufficient: every Ready
 		// manager replica can independently serve the webhook leaf. Include each
 		// one in the durable target snapshot so a rollover cannot retire its old
 		// root until every serving process reports its in-memory swap.
 		targets := []rotation.Target{{
-			ID:       "apiserver:" + d.Names.WebhookService,
+			ID:       bindingTargetID(domain),
 			Evidence: map[string]string{"role": "webhook", "probeOnly": "true"},
 		}}
-		pods, err := d.Client.CoreV1().Pods(d.Names.Namespace).List(ctx, metav1.ListOptions{LabelSelector: managerPodSelector(d.Names)})
+		pods, err := d.Client.CoreV1().Pods(d.Names.Namespace).List(ctx, metav1.ListOptions{LabelSelector: webhookPodSelector(d.Names)})
 		if err != nil {
 			return nil, err
 		}
@@ -446,7 +465,7 @@ func (d Discoverer) Discover(ctx context.Context, domain rotation.Domain) ([]rot
 		}
 		sort.Slice(targets, func(first, second int) bool { return targets[first].ID < targets[second].ID })
 		return targets, nil
-	case "mtls":
+	case rotation.ProfileMTLS:
 		nodes, err := d.Client.CoreV1().Nodes().List(ctx, metav1.ListOptions{LabelSelector: selectorString(d.Names.NodeSelector)})
 		if err != nil {
 			return nil, err
@@ -455,11 +474,13 @@ func (d Discoverer) Discover(ctx context.Context, domain rotation.Domain) ([]rot
 		if port == 0 {
 			port = 10443
 		}
-		targets := make([]rotation.Target, 0, len(nodes.Items))
+		targets := []rotation.Target{{ID: bindingTargetID(domain), Evidence: map[string]string{"role": "client", "probeOnly": "true"}}}
+		serverTargets := 0
 		for _, node := range nodes.Items {
 			for _, address := range node.Status.Addresses {
 				if address.Type == corev1.NodeInternalIP && net.ParseIP(address.Address) != nil {
 					targets = append(targets, rotation.Target{ID: "node:" + string(node.UID), Evidence: map[string]string{"role": "server", "nodeName": node.Name, "internalIP": address.Address, "port": fmt.Sprintf("%d", port)}})
+					serverTargets++
 					break
 				}
 			}
@@ -474,28 +495,74 @@ func (d Discoverer) Discover(ctx context.Context, domain rotation.Domain) ([]rot
 			}
 			targets = append(targets, rotation.Target{ID: "manager:" + string(pod.UID), Evidence: map[string]string{"role": "client", "podName": pod.Name}})
 		}
-		if len(targets) == 0 {
+		if serverTargets == 0 {
 			return nil, fmt.Errorf("no selected Nodes have an InternalIP")
 		}
 		sort.Slice(targets, func(first, second int) bool { return targets[first].ID < targets[second].ID })
 		return targets, nil
+	case rotation.ProfileServiceMTLS:
+		configured, err := d.Names.serviceMTLS(domain.Name)
+		if err != nil {
+			return nil, err
+		}
+		targets := []rotation.Target{{ID: bindingTargetID(domain), Evidence: map[string]string{"role": "server", "probeOnly": "true"}}}
+		serverTargets, err := d.servicePodTargets(ctx, configured.ServerNamespace, configured.ServerPodSelector, "server")
+		if err != nil {
+			return nil, fmt.Errorf("discover service-mTLS server consumers: %w", err)
+		}
+		clientTargets, err := d.servicePodTargets(ctx, configured.ClientNamespace, configured.ClientPodSelector, "client")
+		if err != nil {
+			return nil, fmt.Errorf("discover service-mTLS client consumers: %w", err)
+		}
+		targets = append(targets, serverTargets...)
+		targets = append(targets, clientTargets...)
+		sort.Slice(targets, func(first, second int) bool { return targets[first].ID < targets[second].ID })
+		return targets, nil
 	default:
-		return nil, fmt.Errorf("unsupported domain %q", domain.Name)
+		return nil, fmt.Errorf("unsupported domain profile %q", domain.Profile)
 	}
+}
+
+func bindingTargetID(domain rotation.Domain) string {
+	binding := domain.Metadata["bindingHash"]
+	if binding == "" {
+		binding = domain.ConfigurationHash
+	}
+	return "probe:" + domain.Name + ":" + binding
+}
+
+func (d Discoverer) servicePodTargets(ctx context.Context, namespace, selector, role string) ([]rotation.Target, error) {
+	pods, err := d.Client.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
+	if err != nil {
+		return nil, err
+	}
+	targets := make([]rotation.Target, 0, len(pods.Items))
+	for index := range pods.Items {
+		pod := &pods.Items[index]
+		if pod.UID == "" || !podReady(pod) {
+			continue
+		}
+		id, err := contractv1.PodTargetID(role, string(pod.UID))
+		if err != nil {
+			return nil, err
+		}
+		targets = append(targets, rotation.Target{ID: id, Evidence: map[string]string{
+			"role": role, "podName": pod.Name, "podNamespace": pod.Namespace, "podUID": string(pod.UID),
+		}})
+	}
+	return targets, nil
 }
 
 func managerPodSelector(names Names) string {
-	if names.ManagerPodSelector != "" {
-		return names.ManagerPodSelector
-	}
-	return defaultManagerPodSelector
+	return names.ManagerPodSelector
+}
+
+func webhookPodSelector(names Names) string {
+	return names.WebhookPodSelector
 }
 
 func zeistdPodSelector(names Names) string {
-	if names.ZeistdPodSelector != "" {
-		return names.ZeistdPodSelector
-	}
-	return defaultZeistdPodSelector
+	return names.ZeistdPodSelector
 }
 
 func podReady(pod *corev1.Pod) bool {
@@ -565,24 +632,31 @@ func (p Publisher) Publish(ctx context.Context, publication rotation.Publication
 		// the candidate root before the production webhook leaf changes. Keep
 		// this order on every replay: canary leaf, both trust configurations,
 		// then the production leaf.
-		if err := p.applySecret(ctx, p.Names.WebhookCanarySecret, corev1.SecretTypeTLS, material.WebhookCanaryTLS, publication, "canary"); err != nil {
+		if err := p.applySecret(ctx, p.Names.Namespace, p.Names.WebhookCanarySecret, corev1.SecretTypeTLS, material.WebhookCanaryTLS, publication, "canary"); err != nil {
 			return err
 		}
 		if err := p.publishWebhookTrust(ctx, material.TrustBundle, material.CanaryTrustBundle); err != nil {
 			return err
 		}
-		return p.applySecret(ctx, p.Names.WebhookSecret, corev1.SecretTypeTLS, material.WebhookTLS, publication, "webhook")
+		return p.applySecret(ctx, p.Names.Namespace, p.Names.WebhookSecret, corev1.SecretTypeTLS, material.WebhookTLS, publication, "webhook")
 	case "mtls":
-		if err := p.applySecret(ctx, p.Names.ServerSecret, corev1.SecretTypeTLS, material.ServerTLS, publication, "server"); err != nil {
+		if err := p.applySecret(ctx, p.Names.Namespace, p.Names.ServerSecret, corev1.SecretTypeTLS, material.ServerTLS, publication, "server"); err != nil {
 			return err
 		}
-		return p.applySecret(ctx, p.Names.ClientSecret, corev1.SecretTypeTLS, material.ClientTLS, publication, "client")
+		return p.applySecret(ctx, p.Names.Namespace, p.Names.ClientSecret, corev1.SecretTypeTLS, material.ClientTLS, publication, "client")
 	default:
-		return fmt.Errorf("unsupported domain %q", publication.Domain)
+		configured, err := p.Names.serviceMTLS(publication.Domain)
+		if err != nil {
+			return err
+		}
+		if err := p.applySecret(ctx, configured.ServerNamespace, configured.ServerSecret, corev1.SecretTypeTLS, material.ServerTLS, publication, "server"); err != nil {
+			return err
+		}
+		return p.applySecret(ctx, configured.ClientNamespace, configured.ClientSecret, corev1.SecretTypeTLS, material.ClientTLS, publication, "client")
 	}
 }
 
-func (p Publisher) applySecret(ctx context.Context, name string, secretType corev1.SecretType, data map[string][]byte, publication rotation.Publication, role string) error {
+func (p Publisher) applySecret(ctx context.Context, namespace, name string, secretType corev1.SecretType, data map[string][]byte, publication rotation.Publication, role string) error {
 	if len(data) == 0 {
 		return fmt.Errorf("publication has no Secret data for %q", name)
 	}
@@ -591,9 +665,9 @@ func (p Publisher) applySecret(ctx context.Context, name string, secretType core
 		return fmt.Errorf("publication has no %q fingerprint material", role)
 	}
 	annotations := publicationAnnotations(publication, material)
-	secret, err := p.Client.CoreV1().Secrets(p.Names.Namespace).Get(ctx, name, metav1.GetOptions{})
+	secret, err := p.Client.CoreV1().Secrets(namespace).Get(ctx, name, metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
-		_, err = p.Client.CoreV1().Secrets(p.Names.Namespace).Create(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: p.Names.Namespace, Annotations: annotations}, Type: secretType, Data: cloneData(data)}, metav1.CreateOptions{})
+		_, err = p.Client.CoreV1().Secrets(namespace).Create(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace, Annotations: annotations}, Type: secretType, Data: cloneData(data)}, metav1.CreateOptions{})
 		return err
 	}
 	if err != nil {
@@ -620,7 +694,7 @@ func (p Publisher) applySecret(ctx context.Context, name string, secretType core
 			secret.Type = secretType
 			secret.Data = cloneData(data)
 			secret.Annotations = mergeManagedAnnotations(secret.Annotations, annotations)
-			_, err = p.Client.CoreV1().Secrets(p.Names.Namespace).Update(ctx, secret, metav1.UpdateOptions{})
+			_, err = p.Client.CoreV1().Secrets(namespace).Update(ctx, secret, metav1.UpdateOptions{})
 			return err
 		}
 		if secret.Annotations[annotationDomain] != publication.Domain {
@@ -635,7 +709,7 @@ func (p Publisher) applySecret(ctx context.Context, name string, secretType core
 	secret.Type = secretType
 	secret.Data = cloneData(data)
 	secret.Annotations = mergeManagedAnnotations(secret.Annotations, annotations)
-	_, err = p.Client.CoreV1().Secrets(p.Names.Namespace).Update(ctx, secret, metav1.UpdateOptions{})
+	_, err = p.Client.CoreV1().Secrets(namespace).Update(ctx, secret, metav1.UpdateOptions{})
 	return err
 }
 
@@ -722,19 +796,14 @@ func cloneData(data map[string][]byte) map[string][]byte {
 // AcknowledgementLeaseName makes per-consumer observation names stable and
 // readable while avoiding direct use of user-controlled pod names.
 func AcknowledgementLeaseName(domain, targetID string) string {
-	sum := sha256.Sum256([]byte(targetID))
-	return "zeist-pki-ack-" + domain + "-" + hex.EncodeToString(sum[:])[:16]
+	return contractv1.AcknowledgementLeaseName(domain, targetID)
 }
 
-// AcknowledgementLeaseData is encoded in a lease annotation by consumers only
-// after their in-memory atomic TLS swap succeeded.
-type AcknowledgementLeaseData struct {
-	Generation       uint64 `json:"generation"`
-	LeafFingerprint  string `json:"leafFingerprint"`
-	TrustFingerprint string `json:"trustFingerprint"`
-}
+// AcknowledgementLeaseData is retained as an alias for existing integrations.
+// New consumers should import contract/v1 directly.
+type AcknowledgementLeaseData = contractv1.Acknowledgement
 
-const acknowledgementAnnotation = "pki.zeist.io/acknowledgement"
+const acknowledgementAnnotation = contractv1.AcknowledgementAnnotation
 
 // Verifier checks exact consumer acknowledgement Leases. Its transport probe
 // hook allows the Zeist integration to additionally prove live TLS endpoints.
@@ -785,9 +854,8 @@ func (v Verifier) Verify(ctx context.Context, request rotation.VerificationReque
 		if err := pods.verify(target, *lease.Spec.HolderIdentity); err != nil {
 			return nil, fmt.Errorf("acknowledgement for %q is not owned by its expected consumer: %w", target.ID, err)
 		}
-		encoded := lease.Annotations[acknowledgementAnnotation]
-		var data AcknowledgementLeaseData
-		if err := json.Unmarshal([]byte(encoded), &data); err != nil {
+		data, err := contractv1.DecodeAcknowledgement(lease.Annotations[acknowledgementAnnotation])
+		if err != nil {
 			return nil, fmt.Errorf("decode acknowledgement for %q: %w", target.ID, err)
 		}
 		if data.Generation != request.Generation || data.LeafFingerprint != expected.LeafFingerprint || data.TrustFingerprint != expected.TrustFingerprint {
@@ -805,6 +873,7 @@ type acknowledgementPodIndex struct {
 	managers map[string]*corev1.Pod
 	zeistd   map[string]*corev1.Pod
 	nodes    map[string]*corev1.Node
+	pods     map[string]*corev1.Pod
 }
 
 func (v Verifier) acknowledgementPodIndex(ctx context.Context, targets []rotation.Target) (acknowledgementPodIndex, error) {
@@ -812,6 +881,7 @@ func (v Verifier) acknowledgementPodIndex(ctx context.Context, targets []rotatio
 		managers: make(map[string]*corev1.Pod),
 		zeistd:   make(map[string]*corev1.Pod),
 		nodes:    make(map[string]*corev1.Node),
+		pods:     make(map[string]*corev1.Pod),
 	}
 	needManagers, needZeistd := false, false
 	for _, target := range targets {
@@ -827,17 +897,41 @@ func (v Verifier) acknowledgementPodIndex(ctx context.Context, targets []rotatio
 			needManagers = true
 		case "zeistd":
 			needZeistd = true
+		case "pod":
+			podName, namespace := target.Evidence["podName"], target.Evidence["podNamespace"]
+			if podName == "" || namespace == "" {
+				return acknowledgementPodIndex{}, fmt.Errorf("Pod target %q has incomplete identity evidence", target.ID)
+			}
+			pod, getErr := v.Client.CoreV1().Pods(namespace).Get(ctx, podName, metav1.GetOptions{})
+			if getErr != nil {
+				return acknowledgementPodIndex{}, fmt.Errorf("read selected Pod %s/%s: %w", namespace, podName, getErr)
+			}
+			if string(pod.UID) != target.Evidence["podUID"] || !podReady(pod) {
+				return acknowledgementPodIndex{}, fmt.Errorf("selected Pod %s/%s no longer matches Ready target %q", namespace, podName, target.ID)
+			}
+			index.pods[string(pod.UID)] = pod
 		}
 	}
 	if needManagers {
-		pods, err := v.Client.CoreV1().Pods(v.Names.Namespace).List(ctx, metav1.ListOptions{LabelSelector: managerPodSelector(v.Names)})
-		if err != nil {
-			return acknowledgementPodIndex{}, fmt.Errorf("list selected manager Pods: %w", err)
-		}
-		for itemIndex := range pods.Items {
-			pod := &pods.Items[itemIndex]
-			if pod.UID != "" && podReady(pod) {
-				index.managers[string(pod.UID)] = pod
+		selectors := []string{managerPodSelector(v.Names), webhookPodSelector(v.Names)}
+		seenSelectors := make(map[string]struct{}, len(selectors))
+		for _, selector := range selectors {
+			if selector == "" {
+				continue
+			}
+			if _, found := seenSelectors[selector]; found {
+				continue
+			}
+			seenSelectors[selector] = struct{}{}
+			pods, err := v.Client.CoreV1().Pods(v.Names.Namespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
+			if err != nil {
+				return acknowledgementPodIndex{}, fmt.Errorf("list selected manager Pods: %w", err)
+			}
+			for itemIndex := range pods.Items {
+				pod := &pods.Items[itemIndex]
+				if pod.UID != "" && podReady(pod) {
+					index.managers[string(pod.UID)] = pod
+				}
 			}
 		}
 	}
@@ -912,12 +1006,27 @@ func (p acknowledgementPodIndex) verify(target rotation.Target, holderIdentity s
 			return fmt.Errorf("Node %q no longer matches target UID %q", nodeName, expectedID)
 		}
 		return nil
+	case "pod":
+		if holderIdentity != expectedID {
+			return fmt.Errorf("lease holder %q does not match Pod UID %q", holderIdentity, expectedID)
+		}
+		if _, found := p.pods[expectedID]; !found {
+			return fmt.Errorf("Pod UID %q is not a selected Ready consumer", expectedID)
+		}
+		return nil
 	default:
 		return fmt.Errorf("unsupported acknowledgement target kind %q", kind)
 	}
 }
 
 func acknowledgementTargetIdentity(target rotation.Target) (kind, identity string, err error) {
+	if podUID := target.Evidence["podUID"]; podUID != "" {
+		expected, targetErr := contractv1.PodTargetID(target.Evidence["role"], podUID)
+		if targetErr != nil || target.ID != expected {
+			return "", "", fmt.Errorf("service acknowledgement target has invalid Pod identity %q", target.ID)
+		}
+		return "pod", podUID, nil
+	}
 	switch target.Evidence["role"] {
 	case "client", "webhook":
 		identity, found := strings.CutPrefix(target.ID, "manager:")
@@ -954,11 +1063,7 @@ func acknowledgementNamespace(names Names) string {
 // EncodeAcknowledgement encodes credential-free in-memory evidence for a
 // consumer to put in its acknowledgement Lease annotation.
 func EncodeAcknowledgement(data AcknowledgementLeaseData) (string, error) {
-	encoded, err := json.Marshal(data)
-	if err != nil {
-		return "", err
-	}
-	return string(encoded), nil
+	return contractv1.EncodeAcknowledgement(data)
 }
 
 // DecodeCAData is a narrow helper for an adapter that stores restricted CA

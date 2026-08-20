@@ -36,8 +36,9 @@ const (
 type Profile string
 
 const (
-	ProfileWebhook Profile = "webhook"
-	ProfileMTLS    Profile = "mtls"
+	ProfileWebhook     Profile = "webhook"
+	ProfileMTLS        Profile = "mtls"
+	ProfileServiceMTLS Profile = "service-mtls"
 )
 
 // Policy controls expiration and the overlap required to retire a trust root.
@@ -50,7 +51,7 @@ type Policy struct {
 	ClockSkew           time.Duration `json:"clockSkew" yaml:"clockSkew"`
 }
 
-// DefaultPolicy returns the safe v0.1 lifecycle policy.
+// DefaultPolicy returns the safe built-in lifecycle policy.
 func DefaultPolicy() Policy {
 	return Policy{
 		RootValidity:        365 * 24 * time.Hour,
@@ -94,7 +95,7 @@ func (d Domain) Validate() error {
 	if d.Name == "" {
 		return fmt.Errorf("domain name is required")
 	}
-	if d.Profile != ProfileWebhook && d.Profile != ProfileMTLS {
+	if d.Profile != ProfileWebhook && d.Profile != ProfileMTLS && d.Profile != ProfileServiceMTLS {
 		return fmt.Errorf("domain %q has unsupported profile %q", d.Name, d.Profile)
 	}
 	if d.ConfigurationHash == "" {

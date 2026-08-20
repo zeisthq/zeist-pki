@@ -7,9 +7,35 @@ webhook:
   canaryService: platform-webhook-rotation-canary
   canarySecret: platform-webhook-rotation-canary-tls
   canaryConfiguration: platform-pki-rotation-canary
+  podSelector:
+    app.example.io/name: platform-manager
+  configurationNames:
+    - platform-mutating-webhooks
+    - platform-validating-webhooks
+  canaryResourcePath: /apis/platform.example.io/v1/widgets/platform-pki-rotation-canary
+  canaryAnnotation: pki.example.io/rotation-canary
 mtls:
   serverSecret: platform-server-tls
   clientSecret: platform-client-tls
+  service: platform-runner
   nodeSelector:
     platform.example.io/private-tls: "true"
+  clientPodSelector:
+    app.example.io/name: platform-manager
+  serverPodSelector:
+    app.example.io/name: platform-runner
   port: 10443
+serviceMTLS:
+  - name: internal-api
+    server:
+      namespace: platform-system
+      service: internal-api
+      secret: internal-api-server-tls
+      podSelector:
+        pki.example.io/internal-api-role: server
+      port: 8443
+    client:
+      namespace: application-system
+      secret: internal-api-client-tls
+      podSelector:
+        pki.example.io/internal-api-role: client

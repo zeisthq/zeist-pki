@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
+	"strings"
 
 	"github.com/zeisthq/zeist-pki/config"
 	pkikubernetes "github.com/zeisthq/zeist-pki/integration/kubernetes"
@@ -124,19 +126,28 @@ func (kubernetesRuntimeFactory) Build(_ context.Context, options RuntimeOptions)
 		WebhookSecret: options.Config.Webhook.Secret, WebhookService: options.Config.Webhook.Service,
 		WebhookCanarySecret: options.Config.Webhook.CanarySecret, WebhookCanaryService: options.Config.Webhook.CanaryService,
 		WebhookCanaryConfiguration: options.Config.Webhook.CanaryConfiguration,
+		WebhookCanaryResourcePath:  options.Config.Webhook.CanaryResourcePath,
+		WebhookCanaryAnnotation:    options.Config.Webhook.CanaryAnnotation,
 		APIServerEndpoints:         options.Config.Webhook.APIServerEndpoints,
 		ServerSecret:               options.Config.MTLS.ServerSecret, ClientSecret: options.Config.MTLS.ClientSecret,
-		RunnerService: "zeistd", NodeSelector: options.Config.MTLS.NodeSelector, Port: options.Config.MTLS.Port,
-		ManagerPodSelector: "app.kubernetes.io/name=zeist-engine,app.kubernetes.io/component=controller-manager",
-		ZeistdPodSelector:  "app.kubernetes.io/name=zeistd,app.kubernetes.io/component=firecracker-runner",
-		WebhookConfigurationNames: []string{
-			"zeist-engine-mutating-webhook-configuration",
-			"zeist-engine-validating-webhook-configuration",
-		},
+		RunnerService: options.Config.MTLS.Service, NodeSelector: options.Config.MTLS.NodeSelector, Port: options.Config.MTLS.Port,
+		WebhookPodSelector:        selectorFromMap(options.Config.Webhook.PodSelector),
+		ManagerPodSelector:        selectorFromMap(options.Config.MTLS.ClientPodSelector),
+		ZeistdPodSelector:         selectorFromMap(options.Config.MTLS.ServerPodSelector),
+		WebhookConfigurationNames: append([]string(nil), options.Config.Webhook.ConfigurationNames...),
+		ServiceMTLS:               make(map[string]pkikubernetes.ServiceMTLSNames, len(options.Config.ServiceMTLS)),
+	}
+	for _, service := range options.Config.ServiceMTLS {
+		names.ServiceMTLS[service.Name] = pkikubernetes.ServiceMTLSNames{
+			ServerNamespace: service.Server.Namespace, ServerService: service.Server.Service, ServerSecret: service.Server.Secret,
+			ServerPodSelector: selectorFromMap(service.Server.PodSelector), ServerPort: service.Server.Port,
+			ClientNamespace: service.Client.Namespace, ClientSecret: service.Client.Secret,
+			ClientPodSelector: selectorFromMap(service.Client.PodSelector), ClusterDomain: service.EffectiveClusterDomain(),
+		}
 	}
 	store := pkikubernetes.StateStore{Client: client, Namespace: names.Namespace}
 	issuer := pkikubernetes.Issuer{Client: client, Names: names}
-	canary, err := pkikubernetes.NewWebhookAdmissionCanary(options.RESTConfig, names.APIServerEndpoints)
+	canary, err := pkikubernetes.NewWebhookAdmissionCanary(options.RESTConfig, names.APIServerEndpoints, names.WebhookCanaryResourcePath, names.WebhookCanaryAnnotation)
 	if err != nil {
 		return nil, fmt.Errorf("configure webhook activation canary: %w", err)
 	}
@@ -151,4 +162,17 @@ func (kubernetesRuntimeFactory) Build(_ context.Context, options RuntimeOptions)
 	}
 	recoverer := pkikubernetes.Recoverer{Client: client, Store: store, Locker: locker, Issuer: issuer, Names: names}
 	return ReconcilerRuntime{Store: store, Reconciler: reconciler, Verifier: verifier, RecoverFunc: recoverer.Recover}, nil
+}
+
+func selectorFromMap(selector map[string]string) string {
+	keys := make([]string, 0, len(selector))
+	for key := range selector {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		parts = append(parts, key+"="+selector[key])
+	}
+	return strings.Join(parts, ",")
 }

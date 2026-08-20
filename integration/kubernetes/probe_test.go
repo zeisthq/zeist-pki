@@ -11,13 +11,16 @@ import (
 	"k8s.io/client-go/rest"
 )
 
-func TestWebhookAdmissionCanaryUsesDryRunSandboxPoolUpdate(t *testing.T) {
+func TestWebhookAdmissionCanaryUsesConfiguredDryRunUpdate(t *testing.T) {
+	const (
+		path       = "/apis/example.io/v1/widgets/rotation-canary"
+		annotation = "pki.example.io/rotation-canary"
+	)
 	requests := 0
 	transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
 		requests++
-		path := "/apis/sandbox.zeist.io/v1alpha1/sandboxpools/" + webhookCanaryPoolName
 		if request.Method == http.MethodGet && request.URL.Path == path {
-			return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(`{"apiVersion":"sandbox.zeist.io/v1alpha1","kind":"SandboxPool","metadata":{"name":"zeist-pki-rotation-canary","resourceVersion":"42"},"spec":{"runtime":"base","resourceClass":{"cpu":"500m","memory":"1Gi","storage":"5Gi"},"capacitySpec":{"bufferMin":0,"bufferMax":0}},"status":{"observedGeneration":1}}`)), Request: request}, nil
+			return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(`{"apiVersion":"example.io/v1","kind":"Widget","metadata":{"name":"rotation-canary","resourceVersion":"42"},"spec":{"mode":"probe"},"status":{"observedGeneration":1}}`)), Request: request}, nil
 		}
 		if request.Method != http.MethodPut || request.URL.Path != path || request.URL.Query().Get("dryRun") != "All" {
 			return &http.Response{StatusCode: http.StatusBadRequest, Body: io.NopCloser(strings.NewReader(`{"message":"wrong request"}`)), Request: request}, nil
@@ -34,7 +37,7 @@ func TestWebhookAdmissionCanaryUsesDryRunSandboxPoolUpdate(t *testing.T) {
 		spec, _ := object["spec"].(map[string]any)
 		annotations, _ := metadata["annotations"].(map[string]any)
 		status, _ := object["status"].(map[string]any)
-		if object["kind"] != "SandboxPool" || metadata["name"] != webhookCanaryPoolName || metadata["resourceVersion"] != "42" || annotations["pki.zeist.io/rotation-canary"] == "" || spec["runtime"] != "base" || status["observedGeneration"] != float64(1) {
+		if object["kind"] != "Widget" || metadata["name"] != "rotation-canary" || metadata["resourceVersion"] != "42" || annotations[annotation] == "" || spec["mode"] != "probe" || status["observedGeneration"] != float64(1) {
 			return &http.Response{StatusCode: http.StatusBadRequest, Body: io.NopCloser(strings.NewReader(`{"message":"wrong object"}`)), Request: request}, nil
 		}
 		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(`{}`)), Request: request}, nil
@@ -42,7 +45,7 @@ func TestWebhookAdmissionCanaryUsesDryRunSandboxPoolUpdate(t *testing.T) {
 
 	canary, err := NewWebhookAdmissionCanary(&rest.Config{
 		Host: "https://api.example.test", Transport: transport,
-	}, []string{"https://api.example.test", "https://api.example.test"})
+	}, []string{"https://api.example.test", "https://api.example.test"}, path, annotation)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,7 +68,7 @@ func TestWebhookAdmissionCanaryRejectsNonOriginConfiguredEndpoint(t *testing.T) 
 		"https://api.example.test/path",
 		"https://api.example.test?",
 	} {
-		if _, err := NewWebhookAdmissionCanary(&rest.Config{Host: "https://api.example.test"}, []string{endpoint}); err == nil {
+		if _, err := NewWebhookAdmissionCanary(&rest.Config{Host: "https://api.example.test"}, []string{endpoint}, "/apis/example.io/v1/widgets/canary", "pki.example.io/canary"); err == nil {
 			t.Fatalf("canary accepted non-origin endpoint %q", endpoint)
 		}
 	}

@@ -156,7 +156,7 @@ func TestEnvtestDiscoveryAndVerifierUseCurrentNodePodAndLeaseEvidence(t *testing
 		ZeistdPodSelector:        "app=zeistd",
 		NodeSelector:             map[string]string{"pki.zeist.io/envtest": "true"},
 	}
-	targets, err := (Discoverer{Client: envtestClient, Names: names}).Discover(ctx, rotation.Domain{Name: "mtls"})
+	targets, err := (Discoverer{Client: envtestClient, Names: names}).Discover(ctx, rotation.Domain{Name: "mtls", Profile: rotation.ProfileMTLS})
 	if err != nil {
 		t.Fatalf("discover current targets: %v", err)
 	}
@@ -169,8 +169,8 @@ func TestEnvtestDiscoveryAndVerifierUseCurrentNodePodAndLeaseEvidence(t *testing
 		Generation: 7,
 		Targets:    targets,
 		Publication: rotation.Publication{Materials: map[string]rotation.MaterialFingerprint{
-			"client": {LeafFingerprint: "client-leaf", TrustFingerprint: "client-trust"},
-			"server": {LeafFingerprint: "server-leaf", TrustFingerprint: "server-trust"},
+			"client": {LeafFingerprint: canonicalTestFingerprint("client-leaf"), TrustFingerprint: canonicalTestFingerprint("client-trust")},
+			"server": {LeafFingerprint: canonicalTestFingerprint("server-leaf"), TrustFingerprint: canonicalTestFingerprint("server-trust")},
 		}},
 	}
 	for _, target := range targets {
@@ -247,8 +247,8 @@ func TestEnvtestPublisherWritesSecretsAndNamedWebhookConfigurations(t *testing.T
 		Generation:  7,
 		OperationID: "envtest-publication",
 		Materials: map[string]rotation.MaterialFingerprint{
-			"webhook": {LeafFingerprint: "webhook-leaf", TrustFingerprint: "production-trust"},
-			"canary":  {LeafFingerprint: "canary-leaf", TrustFingerprint: "candidate-trust"},
+			"webhook": {LeafFingerprint: canonicalTestFingerprint("webhook-leaf"), TrustFingerprint: canonicalTestFingerprint("production-trust")},
+			"canary":  {LeafFingerprint: canonicalTestFingerprint("canary-leaf"), TrustFingerprint: canonicalTestFingerprint("candidate-trust")},
 		},
 		Opaque: PublicationMaterial{
 			WebhookTLS:        map[string][]byte{"tls.crt": []byte("webhook-cert"), "tls.key": []byte("webhook-key")},

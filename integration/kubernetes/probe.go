@@ -23,8 +23,6 @@ import (
 	"github.com/zeisthq/zeist-pki/rotation"
 )
 
-const webhookCanaryPoolName = "zeist-pki-rotation-canary"
-
 // LiveProbe returns the bundled Zeist activation probe. It verifies each
 // mTLS node with TLS 1.3 /v2/status using the just-published client identity.
 // For webhook trust it verifies the exact configured caBundle, a dry-run
@@ -35,7 +33,7 @@ const webhookCanaryPoolName = "zeist-pki-rotation-canary"
 type WebhookCanary func(context.Context) error
 
 func LiveProbe(client kubernetes.Interface, names Names, canary ...WebhookCanary) func(context.Context, rotation.VerificationRequest) error {
-	webhookCanary := defaultWebhookCanary(client)
+	webhookCanary := defaultWebhookCanary(client, names)
 	if len(canary) > 1 {
 		return func(context.Context, rotation.VerificationRequest) error {
 			return fmt.Errorf("only one webhook admission canary is supported")
@@ -45,15 +43,99 @@ func LiveProbe(client kubernetes.Interface, names Names, canary ...WebhookCanary
 		webhookCanary = canary[0]
 	}
 	return func(ctx context.Context, request rotation.VerificationRequest) error {
-		switch request.Domain.Name {
-		case "mtls":
+		switch request.Domain.Profile {
+		case rotation.ProfileMTLS:
 			return probeMTLS(ctx, client, names, request)
-		case "webhook":
+		case rotation.ProfileWebhook:
 			return probeWebhook(ctx, client, names, request, webhookCanary)
+		case rotation.ProfileServiceMTLS:
+			return probeServiceMTLS(ctx, client, names, request)
 		default:
-			return fmt.Errorf("unsupported probe domain %q", request.Domain.Name)
+			return fmt.Errorf("unsupported probe domain profile %q", request.Domain.Profile)
 		}
 	}
+}
+
+func probeServiceMTLS(ctx context.Context, client kubernetes.Interface, names Names, request rotation.VerificationRequest) error {
+	configured, err := names.serviceMTLS(request.Domain.Name)
+	if err != nil {
+		return err
+	}
+	serverName, _ := serviceDNSNames(configured)
+	address := net.JoinHostPort(serverName, strconv.Itoa(int(configured.ServerPort)))
+	return probeServiceMTLSAt(ctx, client, configured, request, address)
+}
+
+func probeServiceMTLSAt(ctx context.Context, client kubernetes.Interface, configured ServiceMTLSNames, request rotation.VerificationRequest, address string) error {
+	return probeServiceMTLSWithDial(ctx, client, configured, request, func(ctx context.Context, tlsConfig *tls.Config) (*tls.Conn, error) {
+		dialer := tls.Dialer{NetDialer: &net.Dialer{Timeout: 10 * time.Second}, Config: tlsConfig}
+		connection, err := dialer.DialContext(ctx, "tcp", address)
+		if err != nil {
+			return nil, err
+		}
+		tlsConnection, ok := connection.(*tls.Conn)
+		if !ok {
+			_ = connection.Close()
+			return nil, fmt.Errorf("service TLS dial returned a non-TLS connection")
+		}
+		return tlsConnection, nil
+	})
+}
+
+func probeServiceMTLSWithDial(ctx context.Context, client kubernetes.Interface, configured ServiceMTLSNames, request rotation.VerificationRequest, dial func(context.Context, *tls.Config) (*tls.Conn, error)) error {
+	secret, err := client.CoreV1().Secrets(configured.ClientNamespace).Get(ctx, configured.ClientSecret, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("read published service client Secret: %w", err)
+	}
+	expectedClient, found := request.Publication.Materials["client"]
+	if !found {
+		return fmt.Errorf("service-mTLS publication has no client material")
+	}
+	expectedServer, found := request.Publication.Materials["server"]
+	if !found {
+		return fmt.Errorf("service-mTLS publication has no server material")
+	}
+	clientLeaf, err := pki.ParseLeafPEM(secret.Data["tls.crt"], secret.Data["tls.key"])
+	if err != nil {
+		return fmt.Errorf("parse published service client Secret: %w", err)
+	}
+	if certificateFingerprint(clientLeaf.Certificate) != expectedClient.LeafFingerprint {
+		return fmt.Errorf("published service client leaf fingerprint does not match verification request")
+	}
+	roots, err := pki.ParseCertificatesPEM(secret.Data["ca.crt"])
+	if err != nil {
+		return fmt.Errorf("parse published service trust bundle: %w", err)
+	}
+	if bundleFingerprint(roots) != expectedClient.TrustFingerprint || expectedServer.TrustFingerprint != expectedClient.TrustFingerprint {
+		return fmt.Errorf("published service trust fingerprint does not match verification request")
+	}
+	tlsCertificate, err := tls.X509KeyPair(secret.Data["tls.crt"], secret.Data["tls.key"])
+	if err != nil {
+		return fmt.Errorf("load published service client key pair: %w", err)
+	}
+	pool := x509.NewCertPool()
+	for _, root := range roots {
+		pool.AddCert(root)
+	}
+	serverName, _ := serviceDNSNames(configured)
+	tlsConfig := &tls.Config{
+		MinVersion:   tls.VersionTLS13,
+		ServerName:   serverName,
+		RootCAs:      pool,
+		Certificates: []tls.Certificate{tlsCertificate},
+		VerifyPeerCertificate: func(rawCertificates [][]byte, _ [][]*x509.Certificate) error {
+			return verifyPeerFingerprint(rawCertificates, expectedServer.LeafFingerprint, "service")
+		},
+	}
+	connection, err := dial(ctx, tlsConfig)
+	if err != nil {
+		return fmt.Errorf("probe service mTLS: %w", err)
+	}
+	defer connection.Close()
+	if connection.ConnectionState().Version != tls.VersionTLS13 {
+		return fmt.Errorf("probe service mTLS did not negotiate TLS 1.3")
+	}
+	return nil
 }
 
 func probeMTLS(ctx context.Context, client kubernetes.Interface, names Names, request rotation.VerificationRequest) error {
@@ -208,12 +290,12 @@ func verifyPublishedWebhookSecret(ctx context.Context, client kubernetes.Interfa
 // Multiple configured API-server endpoints can be supplied through a
 // client-go transport wrapper; this request must succeed through each such
 // endpoint before the caller advances the rotation.
-func defaultWebhookCanary(client kubernetes.Interface) WebhookCanary {
+func defaultWebhookCanary(client kubernetes.Interface, names Names) WebhookCanary {
 	return func(ctx context.Context) error {
 		if client == nil || client.Discovery() == nil || client.Discovery().RESTClient() == nil {
 			return fmt.Errorf("Kubernetes discovery REST client is required for webhook activation canary")
 		}
-		return submitWebhookAdmissionCanary(ctx, client.Discovery().RESTClient())
+		return submitWebhookAdmissionCanary(ctx, client.Discovery().RESTClient(), names.WebhookCanaryResourcePath, names.WebhookCanaryAnnotation)
 	}
 }
 
@@ -221,12 +303,15 @@ func defaultWebhookCanary(client kubernetes.Interface) WebhookCanary {
 // the same authentication and TLS settings as the selected Kubernetes client.
 // Supplying multiple endpoint origins is required for HA control planes whose
 // individual API servers must each prove that they reloaded webhook trust.
-func NewWebhookAdmissionCanary(config *rest.Config, endpoints []string) (WebhookCanary, error) {
+func NewWebhookAdmissionCanary(config *rest.Config, endpoints []string, resourcePath, annotation string) (WebhookCanary, error) {
 	if config == nil {
 		return nil, fmt.Errorf("Kubernetes REST configuration is required")
 	}
 	if len(endpoints) == 0 {
 		endpoints = []string{config.Host}
+	}
+	if resourcePath == "" || annotation == "" {
+		return nil, fmt.Errorf("webhook canary resource path and annotation are required")
 	}
 	canonical := make([]string, 0, len(endpoints))
 	seen := make(map[string]struct{}, len(endpoints))
@@ -258,7 +343,7 @@ func NewWebhookAdmissionCanary(config *rest.Config, endpoints []string) (Webhook
 	}
 	return func(ctx context.Context) error {
 		for _, client := range clients {
-			if err := submitWebhookAdmissionCanary(ctx, client); err != nil {
+			if err := submitWebhookAdmissionCanary(ctx, client, resourcePath, annotation); err != nil {
 				return err
 			}
 		}
@@ -266,34 +351,35 @@ func NewWebhookAdmissionCanary(config *rest.Config, endpoints []string) (Webhook
 	}, nil
 }
 
-func submitWebhookAdmissionCanary(ctx context.Context, restClient rest.Interface) error {
-	// The canary updates one pre-created, zero-buffer SandboxPool under
-	// dry-run. This deliberately uses exact-name get/update permission rather
-	// than broad create permission: the request reaches the normal admission
-	// path, but the PKI ServiceAccount cannot create a workload or persist a
-	// change. The dedicated canary webhook rejects every other operation.
-	path := "/apis/sandbox.zeist.io/v1alpha1/sandboxpools/" + webhookCanaryPoolName
-	raw, err := restClient.Get().AbsPath(path).Do(ctx).Raw()
+func submitWebhookAdmissionCanary(ctx context.Context, restClient rest.Interface, resourcePath, annotation string) error {
+	if resourcePath == "" || annotation == "" {
+		return fmt.Errorf("webhook canary resource path and annotation are required")
+	}
+	name := resourcePath[strings.LastIndex(resourcePath, "/")+1:]
+	if name == "" {
+		return fmt.Errorf("webhook canary resource path has no object name")
+	}
+	raw, err := restClient.Get().AbsPath(resourcePath).Do(ctx).Raw()
 	if err != nil {
-		return fmt.Errorf("read webhook rotation canary SandboxPool: %w", err)
+		return fmt.Errorf("read webhook rotation canary resource: %w", err)
 	}
 	var pool map[string]any
 	if err := json.Unmarshal(raw, &pool); err != nil {
-		return fmt.Errorf("decode webhook rotation canary SandboxPool: %w", err)
+		return fmt.Errorf("decode webhook rotation canary resource: %w", err)
 	}
 	metadata, ok := pool["metadata"].(map[string]any)
-	if !ok || metadata["name"] != webhookCanaryPoolName {
-		return fmt.Errorf("webhook rotation canary response is not SandboxPool %q", webhookCanaryPoolName)
+	if !ok || metadata["name"] != name {
+		return fmt.Errorf("webhook rotation canary response does not match %q", name)
 	}
 	if resourceVersion, _ := metadata["resourceVersion"].(string); resourceVersion == "" {
-		return fmt.Errorf("webhook rotation canary SandboxPool has no resourceVersion")
+		return fmt.Errorf("webhook rotation canary resource has no resourceVersion")
 	}
 	annotations, _ := metadata["annotations"].(map[string]any)
 	if annotations == nil {
 		annotations = make(map[string]any)
 		metadata["annotations"] = annotations
 	}
-	annotations["pki.zeist.io/rotation-canary"] = time.Now().UTC().Format(time.RFC3339Nano)
+	annotations[annotation] = time.Now().UTC().Format(time.RFC3339Nano)
 	// Preserve controller-owned status exactly as it was returned. The canary
 	// webhook rejects status changes, and retaining the fetched value makes the
 	// dry-run valid even after the regular SandboxPool controller has populated
@@ -302,7 +388,7 @@ func submitWebhookAdmissionCanary(ctx context.Context, restClient rest.Interface
 	if err != nil {
 		return fmt.Errorf("encode webhook rotation canary: %w", err)
 	}
-	result := restClient.Put().AbsPath(path).
+	result := restClient.Put().AbsPath(resourcePath).
 		Param("dryRun", "All").SetHeader("Content-Type", "application/json").Body(encoded).Do(ctx)
 	if err := result.Error(); err != nil {
 		return fmt.Errorf("dry-run webhook rotation canary: %w", err)
@@ -343,18 +429,22 @@ func probeWebhookServiceTLS(ctx context.Context, names Names, roots []*x509.Cert
 // TLS chain and hostname verification still run before this callback because
 // InsecureSkipVerify remains false; this adds the exact published leaf check.
 func verifyWebhookPeerFingerprint(rawCertificates [][]byte, expected string) error {
+	return verifyPeerFingerprint(rawCertificates, expected, "webhook")
+}
+
+func verifyPeerFingerprint(rawCertificates [][]byte, expected, peer string) error {
 	if expected == "" {
-		return fmt.Errorf("expected webhook leaf fingerprint is required")
+		return fmt.Errorf("expected %s leaf fingerprint is required", peer)
 	}
 	if len(rawCertificates) == 0 {
-		return fmt.Errorf("webhook TLS peer sent no certificates")
+		return fmt.Errorf("%s TLS peer sent no certificates", peer)
 	}
 	leaf, err := x509.ParseCertificate(rawCertificates[0])
 	if err != nil {
-		return fmt.Errorf("parse webhook TLS peer leaf: %w", err)
+		return fmt.Errorf("parse %s TLS peer leaf: %w", peer, err)
 	}
 	if certificateFingerprint(leaf) != expected {
-		return fmt.Errorf("webhook TLS peer leaf fingerprint does not match published material")
+		return fmt.Errorf("%s TLS peer leaf fingerprint does not match published material", peer)
 	}
 	return nil
 }
