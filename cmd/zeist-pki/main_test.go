@@ -17,6 +17,7 @@ type fakeRuntime struct {
 	states       map[string]rotation.VersionedState
 	loadErr      error
 	applyCalls   int
+	applied      []string
 	applyErrors  []error
 	onApply      func(int)
 	recoverCalls []string
@@ -36,6 +37,7 @@ func (r *fakeRuntime) Load(_ context.Context, domain string) (rotation.Versioned
 
 func (r *fakeRuntime) Apply(_ context.Context, domain rotation.Domain) (rotation.Result, error) {
 	r.applyCalls++
+	r.applied = append(r.applied, domain.Name)
 	if r.onApply != nil {
 		r.onApply(r.applyCalls)
 	}
@@ -113,7 +115,20 @@ func TestRecoverRequiresExplicitDomainAndConfirmation(t *testing.T) {
 		t.Fatalf("recover options = %#v", options)
 	}
 	if _, err := parseCommand([]string{"plan", "--config", "pki.yaml", "--domain", "webhook"}); err == nil {
-		t.Fatal("plan accepted recover-only --domain")
+		t.Fatal("plan accepted apply-and-recover-only --domain")
+	}
+}
+
+func TestApplyAcceptsDomainSelectionButRunAlwaysUsesAllDomains(t *testing.T) {
+	options, err := parseCommand([]string{"apply", "--config", "pki.yaml", "--domain", "bucket-broker-lease", "--domain", "bucket-broker-bind"})
+	if err != nil {
+		t.Fatalf("parse selected apply: %v", err)
+	}
+	if got := strings.Join(options.domains, ","); got != "bucket-broker-lease,bucket-broker-bind" {
+		t.Fatalf("apply domains = %q, want command-line values retained for validated selection", got)
+	}
+	if _, err := parseCommand([]string{"run", "--config", "pki.yaml", "--domain", "bucket-broker-bind"}); err == nil || !strings.Contains(err.Error(), "always reconciles every configured domain") {
+		t.Fatalf("parse partial run error = %v, want all-domains requirement", err)
 	}
 }
 
@@ -169,6 +184,39 @@ func TestRecoverySelectionAndConfirmationMappingsAreExact(t *testing.T) {
 	}
 	if _, err := selectRecoveryDomains([]string{"webhook", "webhook"}, configured); err == nil {
 		t.Fatal("duplicate recovery domain did not fail")
+	}
+}
+
+func TestConfiguredDomainSelectionIsExactAndCanonical(t *testing.T) {
+	configured := []rotation.Domain{
+		testDomain("webhook"),
+		testDomain("mtls"),
+		testDomain("bucket-broker-bind"),
+		testDomain("bucket-broker-lease"),
+	}
+	selected, err := selectConfiguredDomains("apply", []string{"bucket-broker-lease", "bucket-broker-bind"}, configured)
+	if err != nil {
+		t.Fatalf("selectConfiguredDomains() error = %v", err)
+	}
+	if got := []string{selected[0].Name, selected[1].Name}; strings.Join(got, ",") != "bucket-broker-bind,bucket-broker-lease" {
+		t.Fatalf("selected domains = %v, want configured canonical order", got)
+	}
+	if _, err := selectConfiguredDomains("apply", []string{"unknown"}, configured); err == nil || !strings.Contains(err.Error(), "unknown configured domain") {
+		t.Fatalf("unknown domain error = %v", err)
+	}
+	if _, err := selectConfiguredDomains("apply", []string{"bucket-broker-bind", "bucket-broker-bind"}, configured); err == nil || !strings.Contains(err.Error(), "duplicate apply domain") {
+		t.Fatalf("duplicate domain error = %v", err)
+	}
+
+	runtime := &fakeRuntime{states: map[string]rotation.VersionedState{
+		"bucket-broker-bind":  {State: testState(configured[2])},
+		"bucket-broker-lease": {State: testState(configured[3])},
+	}}
+	if _, err := applyDomains(context.Background(), runtime, selected); err != nil {
+		t.Fatalf("applyDomains() error = %v", err)
+	}
+	if got := strings.Join(runtime.applied, ","); got != "bucket-broker-bind,bucket-broker-lease" {
+		t.Fatalf("applied domains = %q, want exact canonical selection", got)
 	}
 }
 

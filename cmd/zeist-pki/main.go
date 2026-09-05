@@ -84,6 +84,12 @@ func (a app) execute(ctx context.Context, arguments []string, output io.Writer) 
 	if err != nil {
 		return fmt.Errorf("derive trust domains: %w", err)
 	}
+	if options.name == "apply" && len(options.domains) != 0 {
+		domains, err = selectConfiguredDomains("apply", options.domains, domains)
+		if err != nil {
+			return err
+		}
+	}
 	var recoveryDomains []rotation.Domain
 	var recoveryConfirmations map[string]string
 	if options.name == "recover" {
@@ -178,7 +184,7 @@ func parseCommand(arguments []string) (commandOptions, error) {
 	flags.StringVar(&options.kubeconfig, "kubeconfig", "", "optional kubeconfig fallback path")
 	flags.StringVar(&options.output, "output", "text", "output format: text or json")
 	flags.BoolVar(&options.offline, "offline", false, "plan without reading Kubernetes state")
-	flags.Var((*domainValues)(&options.domains), "domain", "configured trust domain to recover; repeat for each independent recovery")
+	flags.Var((*domainValues)(&options.domains), "domain", "configured trust domain to apply or recover; repeat to select more than one")
 	flags.Var((*stringValues)(&options.confirmations), "confirm-active-root-fingerprint", "domain=fingerprint confirmation; repeat once per selected recovery domain")
 	if err := flags.Parse(arguments[1:]); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -202,8 +208,11 @@ func parseCommand(arguments []string) (commandOptions, error) {
 		if len(options.confirmations) == 0 {
 			return commandOptions{}, fmt.Errorf("recover requires --confirm-active-root-fingerprint for every selected domain")
 		}
-	} else if len(options.domains) != 0 {
-		return commandOptions{}, fmt.Errorf("--domain is supported only by recover")
+	} else if options.name != "apply" && len(options.domains) != 0 {
+		if options.name == "run" {
+			return commandOptions{}, fmt.Errorf("run always reconciles every configured domain and does not accept --domain")
+		}
+		return commandOptions{}, fmt.Errorf("--domain is supported only by apply and recover")
 	}
 	if options.offline && options.name != "plan" {
 		return commandOptions{}, fmt.Errorf("--offline is supported only by plan")
@@ -230,7 +239,7 @@ func (values *domainValues) String() string { return strings.Join(*values, ",") 
 func (values *domainValues) Set(value string) error {
 	value = strings.TrimSpace(value)
 	if value == "" {
-		return fmt.Errorf("recovery domain cannot be empty")
+		return fmt.Errorf("domain cannot be empty")
 	}
 	*values = append(*values, value)
 	return nil
@@ -503,6 +512,14 @@ func selectRecoveryDomains(values []string, configured []rotation.Domain) ([]rot
 	if len(values) == 0 {
 		return nil, fmt.Errorf("recover requires at least one --domain")
 	}
+	return selectConfiguredDomains("recover", values, configured)
+}
+
+// selectConfiguredDomains validates an explicit subset against the complete
+// configuration, then returns it in the configuration's canonical order. The
+// caller still loads and validates the whole configuration before selection;
+// selection limits only the domains mutated by the requested operation.
+func selectConfiguredDomains(operation string, values []string, configured []rotation.Domain) ([]rotation.Domain, error) {
 	known := make(map[string]struct{}, len(configured))
 	for _, domain := range configured {
 		known[domain.Name] = struct{}{}
@@ -511,10 +528,10 @@ func selectRecoveryDomains(values []string, configured []rotation.Domain) ([]rot
 	for _, value := range values {
 		name := strings.TrimSpace(value)
 		if _, found := known[name]; !found {
-			return nil, fmt.Errorf("recover names unknown configured domain %q", name)
+			return nil, fmt.Errorf("%s names unknown configured domain %q", operation, name)
 		}
 		if _, duplicate := requested[name]; duplicate {
-			return nil, fmt.Errorf("duplicate recovery domain %q", name)
+			return nil, fmt.Errorf("duplicate %s domain %q", operation, name)
 		}
 		requested[name] = struct{}{}
 	}
@@ -578,5 +595,10 @@ Recover requires one confirmation per selected domain:
 
 Repeat both flags to recover another selected domain. Domains not named by
 --domain are not read or modified by recover.
+
+Apply reconciles every configured domain by default. Repeat --domain to apply
+only an exact configured subset; selected domains run in canonical config
+order. Run deliberately does not accept --domain and always reconciles all
+configured domains.
 `)
 }

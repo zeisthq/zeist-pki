@@ -159,9 +159,13 @@ credentials, or private-key material.
 `plan` has no side effects: it does not generate keys, acquire a lease, or
 write state. `plan --offline` also avoids reading Kubernetes state and shows
 the deterministic fresh-bootstrap actions. `apply` executes one bounded
-reconciliation. `run` is suitable for one dedicated Deployment or another
-single scheduler; it reconciles immediately and then on its fixed five-minute
-interval with jitter to avoid synchronized work.
+reconciliation over every configured domain by default. Repeat `--domain` on
+`apply` to select an exact subset. The command still loads and validates the
+complete configuration, rejects unknown or duplicate domain names, and applies
+the selected domains in canonical configuration order. `run` is suitable for
+one dedicated Deployment or another single scheduler; it deliberately does not
+accept `--domain`, and reconciles every configured domain immediately and then
+on its fixed five-minute interval with jitter to avoid synchronized work.
 
 `recover` requires one or more repeatable `--domain` flags and an exact
 `--confirm-active-root-fingerprint domain=<fingerprint>` for each selected

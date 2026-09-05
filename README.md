@@ -47,6 +47,9 @@ arbitrary issuer model, service-mesh identity API, or controller framework.
 ```text
 zeist-pki plan    --config pki.yaml
 zeist-pki apply   --config pki.yaml
+zeist-pki apply   --config pki.yaml \
+  --domain bucket-broker-bind \
+  --domain bucket-broker-lease
 zeist-pki run     --config pki.yaml
 zeist-pki status  --config pki.yaml
 zeist-pki verify  --config pki.yaml
@@ -57,10 +60,15 @@ zeist-pki recover --config pki.yaml \
 
 Every command supports `--output=text|json`. `plan` is read-only; `apply`
 performs one bounded reconciliation; and `run` reconciles immediately and then
-every five minutes with jitter and graceful shutdown. `recover` is deliberately
-explicit: it acts only on one or more named domains and requires the observed
-active-root fingerprint for each selected domain. Repeat `--domain` and its
-matching confirmation to recover another independent trust domain.
+every five minutes with jitter and graceful shutdown. By default, `apply`
+reconciles every configured domain. Repeat `--domain` to apply only an exact
+configured subset; the full configuration is still validated and the selected
+domains run in canonical configuration order. Unknown and duplicate selections
+are rejected. `run` deliberately has no partial-domain mode and always
+reconciles every configured domain. `recover` is deliberately explicit: it
+acts only on one or more named domains and requires the observed active-root
+fingerprint for each selected domain. Repeat `--domain` and its matching
+confirmation to recover another independent trust domain.
 
 ## Quick start
 
