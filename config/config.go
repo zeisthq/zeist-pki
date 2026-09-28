@@ -340,9 +340,12 @@ func (f File) DomainHash(domain string) string {
 			parts = append(parts,
 				service.EffectiveClusterDomain(),
 				service.Server.Namespace, service.Server.Service, service.Server.Secret, fmt.Sprintf("%d", service.Server.Port),
-				fmt.Sprintf("%t", service.Server.ProbeOnly),
-				service.Client.Namespace, service.Client.Secret,
 			)
+			// Preserve hashes for existing domains that did not opt into direct probes.
+			if service.Server.ProbeOnly {
+				parts = append(parts, "true")
+			}
+			parts = append(parts, service.Client.Namespace, service.Client.Secret)
 			parts = appendSelector(parts, service.Server.PodSelector)
 			parts = appendSelector(parts, service.Client.PodSelector)
 		}
