@@ -29,6 +29,34 @@ func TestDomainsAreFixedAndIndependent(t *testing.T) {
 	}
 }
 
+func TestProbeOnlyPreservesExistingServiceDomainHash(t *testing.T) {
+	file := File{
+		APIVersion: APIVersion, Namespace: "system",
+		ServiceMTLS: []ServiceMTLS{{
+			Name: "api",
+			Server: ServiceMTLSServer{
+				Namespace: "api", Service: "api", Secret: "api-tls",
+				PodSelector: map[string]string{"role": "server"}, Port: 443,
+			},
+			Client: ServiceMTLSClient{
+				Namespace: "client", Secret: "api-client-tls",
+				PodSelector: map[string]string{"role": "client"},
+			},
+		}},
+	}
+	// Generated with the pre-probe-only release. Existing state must keep this hash.
+	const oldHash = "sha256:2f031a7b9373c05b25b5c12f865ee00cf8c14cc261c87379dfe3e5c4e6456b37"
+	if got := file.DomainHash("api"); got != oldHash {
+		t.Fatalf("existing service domain hash = %q, want %q", got, oldHash)
+	}
+	file.ServiceMTLS[0].Server.ProbeOnly = true
+	// Generated with v0.2.4, which first issued probe-only domains.
+	const probeOnlyHash = "sha256:b015b2999661243aeb6c375b487cd0fdf02b944c84cdbff0d1ed424e569471d3"
+	if got := file.DomainHash("api"); got != probeOnlyHash {
+		t.Fatalf("probe-only service domain hash = %q, want %q", got, probeOnlyHash)
+	}
+}
+
 func TestWebhookCanaryConfigurationIsRequiredAndHashed(t *testing.T) {
 	file := File{
 		APIVersion: APIVersion, Namespace: "system",
