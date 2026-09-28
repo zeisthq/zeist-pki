@@ -141,6 +141,7 @@ func (kubernetesRuntimeFactory) Build(_ context.Context, options RuntimeOptions)
 		names.ServiceMTLS[service.Name] = pkikubernetes.ServiceMTLSNames{
 			ServerNamespace: service.Server.Namespace, ServerService: service.Server.Service, ServerSecret: service.Server.Secret,
 			ServerPodSelector: selectorFromMap(service.Server.PodSelector), ServerPort: service.Server.Port,
+			ServerProbeOnly: service.Server.ProbeOnly,
 			ClientNamespace: service.Client.Namespace, ClientSecret: service.Client.Secret,
 			ClientPodSelector: selectorFromMap(service.Client.PodSelector), ClusterDomain: service.EffectiveClusterDomain(),
 		}

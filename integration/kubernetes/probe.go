@@ -57,17 +57,7 @@ func LiveProbe(client kubernetes.Interface, names Names, canary ...WebhookCanary
 }
 
 func probeServiceMTLS(ctx context.Context, client kubernetes.Interface, names Names, request rotation.VerificationRequest) error {
-	configured, err := names.serviceMTLS(request.Domain.Name)
-	if err != nil {
-		return err
-	}
-	serverName, _ := serviceDNSNames(configured)
-	address := net.JoinHostPort(serverName, strconv.Itoa(int(configured.ServerPort)))
-	return probeServiceMTLSAt(ctx, client, configured, request, address)
-}
-
-func probeServiceMTLSAt(ctx context.Context, client kubernetes.Interface, configured ServiceMTLSNames, request rotation.VerificationRequest, address string) error {
-	return probeServiceMTLSWithDial(ctx, client, configured, request, func(ctx context.Context, tlsConfig *tls.Config) (*tls.Conn, error) {
+	return probeServiceMTLSWithAddressDial(ctx, client, names, request, func(ctx context.Context, tlsConfig *tls.Config, address string) (*tls.Conn, error) {
 		dialer := tls.Dialer{NetDialer: &net.Dialer{Timeout: 10 * time.Second}, Config: tlsConfig}
 		connection, err := dialer.DialContext(ctx, "tcp", address)
 		if err != nil {
@@ -80,6 +70,44 @@ func probeServiceMTLSAt(ctx context.Context, client kubernetes.Interface, config
 		}
 		return tlsConnection, nil
 	})
+}
+
+func probeServiceMTLSWithAddressDial(ctx context.Context, client kubernetes.Interface, names Names,
+	request rotation.VerificationRequest, dial func(context.Context, *tls.Config, string) (*tls.Conn, error)) error {
+	configured, err := names.serviceMTLS(request.Domain.Name)
+	if err != nil {
+		return err
+	}
+	serverName, _ := serviceDNSNames(configured)
+	address := net.JoinHostPort(serverName, strconv.Itoa(int(configured.ServerPort)))
+	probe := func(address string) error {
+		return probeServiceMTLSWithDial(ctx, client, configured, request, func(ctx context.Context, tlsConfig *tls.Config) (*tls.Conn, error) {
+			return dial(ctx, tlsConfig, address)
+		})
+	}
+	if err := probe(address); err != nil {
+		return err
+	}
+	if !configured.ServerProbeOnly {
+		return nil
+	}
+	for _, target := range request.Targets {
+		if target.Evidence["role"] != "server" || target.Evidence["podUID"] == "" {
+			continue
+		}
+		if target.Evidence["probeOnly"] != "true" {
+			return fmt.Errorf("server target %s lacks required direct-probe evidence", target.ID)
+		}
+		podIP := target.Evidence["podIP"]
+		if net.ParseIP(podIP) == nil {
+			return fmt.Errorf("probe-only target %s has invalid Pod IP", target.ID)
+		}
+		address := net.JoinHostPort(podIP, strconv.Itoa(int(configured.ServerPort)))
+		if err := probe(address); err != nil {
+			return fmt.Errorf("probe server %s: %w", target.ID, err)
+		}
+	}
+	return nil
 }
 
 func probeServiceMTLSWithDial(ctx context.Context, client kubernetes.Interface, configured ServiceMTLSNames, request rotation.VerificationRequest, dial func(context.Context, *tls.Config) (*tls.Conn, error)) error {

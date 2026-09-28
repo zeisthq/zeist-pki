@@ -28,6 +28,8 @@ func TestServiceMTLSIssuancePublicationDiscoveryAndProbe(t *testing.T) {
 		ClientNamespace: "clients", ClientSecret: "api-client-tls", ClientPodSelector: "role=client", ClusterDomain: "cluster.local",
 	}
 	serverPod := readyServicePod("servers", "server", "server-uid", map[string]string{"role": "server"})
+	serverPod.Spec.HostNetwork = true
+	serverPod.Status.PodIP = "10.0.0.7"
 	clientPod := readyServicePod("clients", "client", "client-uid", map[string]string{"role": "client"})
 	cluster := fake.NewSimpleClientset(serverPod, clientPod)
 	names := Names{Namespace: "issuer", AcknowledgementNamespace: "acks", ServiceMTLS: map[string]ServiceMTLSNames{"api-access": configured}}
@@ -117,6 +119,75 @@ func TestServiceMTLSIssuancePublicationDiscoveryAndProbe(t *testing.T) {
 	}
 	if len(acknowledgements) != len(targets) {
 		t.Fatalf("acknowledgements = %#v, want one per target", acknowledgements)
+	}
+
+	configured.ServerProbeOnly = true
+	names.ServiceMTLS[domain.Name] = configured
+	secondServer := readyServicePod("servers", "server-two", "server-two-uid", map[string]string{"role": "server"})
+	secondServer.Spec.HostNetwork = true
+	secondServer.Status.PodIP = "10.0.0.8"
+	if _, err := cluster.CoreV1().Pods("servers").Create(ctx, secondServer, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	probeTargets, err := (Discoverer{Client: cluster, Names: names}).Discover(ctx, domain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(probeTargets) != 4 || probeTargets[2].Evidence["probeOnly"] != "true" ||
+		probeTargets[2].Evidence["podIP"] != secondServer.Status.PodIP ||
+		probeTargets[3].Evidence["podIP"] != serverPod.Status.PodIP {
+		t.Fatalf("direct-probe targets = %#v", probeTargets)
+	}
+	if err := cluster.CoordinationV1().Leases("acks").Delete(ctx,
+		AcknowledgementLeaseName(domain.Name, "server:server-uid"), metav1.DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	serviceDial, serviceResult := startMTLSPipe(t, serverSecret)
+	secondPodDial, secondPodResult := startMTLSPipe(t, serverSecret)
+	firstPodDial, firstPodResult := startMTLSPipe(t, serverSecret)
+	seen := make([]string, 0, 3)
+	probeRequest := rotation.VerificationRequest{Domain: domain, Generation: 7, Targets: probeTargets, Publication: publication}
+	if err := probeServiceMTLSWithAddressDial(ctx, cluster, names, probeRequest,
+		func(ctx context.Context, config *tls.Config, address string) (*tls.Conn, error) {
+			seen = append(seen, address)
+			switch len(seen) {
+			case 1:
+				return serviceDial(ctx, config)
+			case 2:
+				return secondPodDial(ctx, config)
+			case 3:
+				return firstPodDial(ctx, config)
+			default:
+				return nil, errors.New("unexpected extra probe")
+			}
+		}); err != nil {
+		t.Fatalf("probe every Ready server: %v", err)
+	}
+	if len(seen) != 3 || seen[0] != "api.servers.svc:443" ||
+		seen[1] != "10.0.0.8:443" || seen[2] != "10.0.0.7:443" {
+		t.Fatalf("probe addresses = %#v", seen)
+	}
+	for _, result := range []<-chan error{serviceResult, secondPodResult, firstPodResult} {
+		if err := <-result; err != nil {
+			t.Fatalf("direct-probe handshake: %v", err)
+		}
+	}
+	freshServiceDial, freshServiceResult := startMTLSPipe(t, serverSecret)
+	if err := probeServiceMTLSWithAddressDial(ctx, cluster, names, probeRequest,
+		func(ctx context.Context, config *tls.Config, address string) (*tls.Conn, error) {
+			if address == "10.0.0.8:443" {
+				return nil, errors.New("stale broker identity")
+			}
+			return freshServiceDial(ctx, config)
+		}); err == nil {
+		t.Fatal("accepted one Ready broker that failed direct TLS verification")
+	}
+	if err := <-freshServiceResult; err != nil {
+		t.Fatal(err)
+	}
+	verifier.Probe = func(context.Context, rotation.VerificationRequest) error { return nil }
+	if _, err := verifier.Verify(ctx, probeRequest); err != nil {
+		t.Fatalf("probe-only server needed a Lease: %v", err)
 	}
 }
 
