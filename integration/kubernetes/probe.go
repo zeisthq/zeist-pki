@@ -14,7 +14,9 @@ import (
 	"strings"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
@@ -78,10 +80,14 @@ func probeServiceMTLSWithAddressDial(ctx context.Context, client kubernetes.Inte
 	if err != nil {
 		return err
 	}
+	tlsConfig, err := serviceProbeTLSConfig(ctx, client, configured, request)
+	if err != nil {
+		return err
+	}
 	serverName, _ := serviceDNSNames(configured)
 	address := net.JoinHostPort(serverName, strconv.Itoa(int(configured.ServerPort)))
 	probe := func(address string) error {
-		return probeServiceMTLSWithDial(ctx, client, configured, request, func(ctx context.Context, tlsConfig *tls.Config) (*tls.Conn, error) {
+		return probeServiceTLSWithDial(ctx, tlsConfig, func(ctx context.Context, tlsConfig *tls.Config) (*tls.Conn, error) {
 			return dial(ctx, tlsConfig, address)
 		})
 	}
@@ -90,6 +96,10 @@ func probeServiceMTLSWithAddressDial(ctx context.Context, client kubernetes.Inte
 	}
 	if !configured.ServerProbeOnly {
 		return nil
+	}
+	servicePort, err := serviceProbePort(ctx, client, configured)
+	if err != nil {
+		return err
 	}
 	for _, target := range request.Targets {
 		if target.Evidence["role"] != "server" || target.Evidence["podUID"] == "" {
@@ -102,7 +112,11 @@ func probeServiceMTLSWithAddressDial(ctx context.Context, client kubernetes.Inte
 		if net.ParseIP(podIP) == nil {
 			return fmt.Errorf("probe-only target %s has invalid Pod IP", target.ID)
 		}
-		address := net.JoinHostPort(podIP, strconv.Itoa(int(configured.ServerPort)))
+		port, err := servicePodProbePort(ctx, client, configured, servicePort, target)
+		if err != nil {
+			return fmt.Errorf("probe server %s: %w", target.ID, err)
+		}
+		address := net.JoinHostPort(podIP, strconv.Itoa(int(port)))
 		if err := probe(address); err != nil {
 			return fmt.Errorf("probe server %s: %w", target.ID, err)
 		}
@@ -111,42 +125,52 @@ func probeServiceMTLSWithAddressDial(ctx context.Context, client kubernetes.Inte
 }
 
 func probeServiceMTLSWithDial(ctx context.Context, client kubernetes.Interface, configured ServiceMTLSNames, request rotation.VerificationRequest, dial func(context.Context, *tls.Config) (*tls.Conn, error)) error {
-	secret, err := client.CoreV1().Secrets(configured.ClientNamespace).Get(ctx, configured.ClientSecret, metav1.GetOptions{})
+	tlsConfig, err := serviceProbeTLSConfig(ctx, client, configured, request)
 	if err != nil {
-		return fmt.Errorf("read published service client Secret: %w", err)
+		return err
+	}
+	return probeServiceTLSWithDial(ctx, tlsConfig, dial)
+}
+
+func serviceProbeTLSConfig(ctx context.Context, client kubernetes.Interface, configured ServiceMTLSNames, request rotation.VerificationRequest) (*tls.Config, error) {
+	readContext, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	secret, err := client.CoreV1().Secrets(configured.ClientNamespace).Get(readContext, configured.ClientSecret, metav1.GetOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("read published service client Secret: %w", err)
 	}
 	expectedClient, found := request.Publication.Materials["client"]
 	if !found {
-		return fmt.Errorf("service-mTLS publication has no client material")
+		return nil, fmt.Errorf("service-mTLS publication has no client material")
 	}
 	expectedServer, found := request.Publication.Materials["server"]
 	if !found {
-		return fmt.Errorf("service-mTLS publication has no server material")
+		return nil, fmt.Errorf("service-mTLS publication has no server material")
 	}
 	clientLeaf, err := pki.ParseLeafPEM(secret.Data["tls.crt"], secret.Data["tls.key"])
 	if err != nil {
-		return fmt.Errorf("parse published service client Secret: %w", err)
+		return nil, fmt.Errorf("parse published service client Secret: %w", err)
 	}
 	if certificateFingerprint(clientLeaf.Certificate) != expectedClient.LeafFingerprint {
-		return fmt.Errorf("published service client leaf fingerprint does not match verification request")
+		return nil, fmt.Errorf("published service client leaf fingerprint does not match verification request")
 	}
 	roots, err := pki.ParseCertificatesPEM(secret.Data["ca.crt"])
 	if err != nil {
-		return fmt.Errorf("parse published service trust bundle: %w", err)
+		return nil, fmt.Errorf("parse published service trust bundle: %w", err)
 	}
 	if bundleFingerprint(roots) != expectedClient.TrustFingerprint || expectedServer.TrustFingerprint != expectedClient.TrustFingerprint {
-		return fmt.Errorf("published service trust fingerprint does not match verification request")
+		return nil, fmt.Errorf("published service trust fingerprint does not match verification request")
 	}
 	tlsCertificate, err := tls.X509KeyPair(secret.Data["tls.crt"], secret.Data["tls.key"])
 	if err != nil {
-		return fmt.Errorf("load published service client key pair: %w", err)
+		return nil, fmt.Errorf("load published service client key pair: %w", err)
 	}
 	pool := x509.NewCertPool()
 	for _, root := range roots {
 		pool.AddCert(root)
 	}
 	serverName, _ := serviceDNSNames(configured)
-	tlsConfig := &tls.Config{
+	return &tls.Config{
 		MinVersion:   tls.VersionTLS13,
 		ServerName:   serverName,
 		RootCAs:      pool,
@@ -154,7 +178,10 @@ func probeServiceMTLSWithDial(ctx context.Context, client kubernetes.Interface, 
 		VerifyPeerCertificate: func(rawCertificates [][]byte, _ [][]*x509.Certificate) error {
 			return verifyPeerFingerprint(rawCertificates, expectedServer.LeafFingerprint, "service")
 		},
-	}
+	}, nil
+}
+
+func probeServiceTLSWithDial(ctx context.Context, tlsConfig *tls.Config, dial func(context.Context, *tls.Config) (*tls.Conn, error)) error {
 	connection, err := dial(ctx, tlsConfig)
 	if err != nil {
 		return fmt.Errorf("probe service mTLS: %w", err)
@@ -164,6 +191,73 @@ func probeServiceMTLSWithDial(ctx context.Context, client kubernetes.Interface, 
 		return fmt.Errorf("probe service mTLS did not negotiate TLS 1.3")
 	}
 	return nil
+}
+
+func serviceProbePort(ctx context.Context, client kubernetes.Interface, configured ServiceMTLSNames) (corev1.ServicePort, error) {
+	readContext, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	service, err := client.CoreV1().Services(configured.ServerNamespace).Get(readContext, configured.ServerService, metav1.GetOptions{})
+	if err != nil {
+		return corev1.ServicePort{}, fmt.Errorf("read probed service: %w", err)
+	}
+	var selected *corev1.ServicePort
+	for index := range service.Spec.Ports {
+		port := &service.Spec.Ports[index]
+		if port.Port != configured.ServerPort || (port.Protocol != "" && port.Protocol != corev1.ProtocolTCP) {
+			continue
+		}
+		if selected != nil {
+			return corev1.ServicePort{}, fmt.Errorf("service has ambiguous TCP port %d", configured.ServerPort)
+		}
+		selected = port
+	}
+	if selected == nil {
+		return corev1.ServicePort{}, fmt.Errorf("service has no TCP port %d", configured.ServerPort)
+	}
+	return *selected, nil
+}
+
+func servicePodProbePort(ctx context.Context, client kubernetes.Interface, configured ServiceMTLSNames,
+	servicePort corev1.ServicePort, target rotation.Target) (int32, error) {
+	if servicePort.TargetPort.Type != intstr.String {
+		port := servicePort.TargetPort.IntVal
+		if port == 0 {
+			port = servicePort.Port
+		}
+		if port <= 0 || port > 65535 {
+			return 0, fmt.Errorf("service target port %d is invalid", port)
+		}
+		return port, nil
+	}
+	name := servicePort.TargetPort.StrVal
+	if name == "" || target.Evidence["podNamespace"] != configured.ServerNamespace || target.Evidence["podName"] == "" {
+		return 0, fmt.Errorf("named service target port has no exact Pod identity")
+	}
+	readContext, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	pod, err := client.CoreV1().Pods(configured.ServerNamespace).Get(readContext, target.Evidence["podName"], metav1.GetOptions{})
+	if err != nil {
+		return 0, fmt.Errorf("read probed server Pod: %w", err)
+	}
+	if string(pod.UID) != target.Evidence["podUID"] || pod.Status.PodIP != target.Evidence["podIP"] {
+		return 0, fmt.Errorf("probed server Pod identity changed")
+	}
+	var port int32
+	for _, container := range pod.Spec.Containers {
+		for _, candidate := range container.Ports {
+			if candidate.Name != name || (candidate.Protocol != "" && candidate.Protocol != corev1.ProtocolTCP) {
+				continue
+			}
+			if port != 0 {
+				return 0, fmt.Errorf("Pod has ambiguous target port %q", name)
+			}
+			port = candidate.ContainerPort
+		}
+	}
+	if port <= 0 || port > 65535 {
+		return 0, fmt.Errorf("Pod has no valid TCP target port %q", name)
+	}
+	return port, nil
 }
 
 func probeMTLS(ctx context.Context, client kubernetes.Interface, names Names, request rotation.VerificationRequest) error {
