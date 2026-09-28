@@ -13,6 +13,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 
@@ -28,8 +29,13 @@ func TestServiceMTLSIssuancePublicationDiscoveryAndProbe(t *testing.T) {
 		ClientNamespace: "clients", ClientSecret: "api-client-tls", ClientPodSelector: "role=client", ClusterDomain: "cluster.local",
 	}
 	serverPod := readyServicePod("servers", "server", "server-uid", map[string]string{"role": "server"})
+	serverPod.Spec.HostNetwork = true
+	serverPod.Spec.Containers = []corev1.Container{{Name: "server", Ports: []corev1.ContainerPort{{Name: "broker-tls", ContainerPort: 18086}}}}
+	serverPod.Status.PodIP = "10.0.0.7"
 	clientPod := readyServicePod("clients", "client", "client-uid", map[string]string{"role": "client"})
-	cluster := fake.NewSimpleClientset(serverPod, clientPod)
+	service := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: "servers", Name: "api"},
+		Spec: corev1.ServiceSpec{Ports: []corev1.ServicePort{{Port: 443, TargetPort: intstr.FromString("broker-tls")}}}}
+	cluster := fake.NewSimpleClientset(serverPod, clientPod, service)
 	names := Names{Namespace: "issuer", AcknowledgementNamespace: "acks", ServiceMTLS: map[string]ServiceMTLSNames{"api-access": configured}}
 	domain := rotation.Domain{
 		Name: "api-access", Profile: rotation.ProfileServiceMTLS, ConfigurationHash: "sha256:config", Policy: rotation.DefaultPolicy(),
@@ -117,6 +123,135 @@ func TestServiceMTLSIssuancePublicationDiscoveryAndProbe(t *testing.T) {
 	}
 	if len(acknowledgements) != len(targets) {
 		t.Fatalf("acknowledgements = %#v, want one per target", acknowledgements)
+	}
+
+	configured.ServerProbeOnly = true
+	names.ServiceMTLS[domain.Name] = configured
+	secondServer := readyServicePod("servers", "server-two", "server-two-uid", map[string]string{"role": "server"})
+	secondServer.Spec.HostNetwork = true
+	secondServer.Spec.Containers = []corev1.Container{{Name: "server", Ports: []corev1.ContainerPort{{Name: "broker-tls", ContainerPort: 18086}}}}
+	secondServer.Status.PodIP = "10.0.0.8"
+	if _, err := cluster.CoreV1().Pods("servers").Create(ctx, secondServer, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	probeTargets, err := (Discoverer{Client: cluster, Names: names}).Discover(ctx, domain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(probeTargets) != 4 || probeTargets[2].Evidence["probeOnly"] != "true" ||
+		probeTargets[2].Evidence["podIP"] != secondServer.Status.PodIP ||
+		probeTargets[3].Evidence["podIP"] != serverPod.Status.PodIP {
+		t.Fatalf("direct-probe targets = %#v", probeTargets)
+	}
+	if err := cluster.CoordinationV1().Leases("acks").Delete(ctx,
+		AcknowledgementLeaseName(domain.Name, "server:server-uid"), metav1.DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	serviceDial, serviceResult := startMTLSPipe(t, serverSecret)
+	secondPodDial, secondPodResult := startMTLSPipe(t, serverSecret)
+	firstPodDial, firstPodResult := startMTLSPipe(t, serverSecret)
+	seen := make([]string, 0, 3)
+	secretGets := 0
+	cluster.PrependReactor("get", "secrets", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		if action.GetNamespace() == configured.ClientNamespace && action.(k8stesting.GetAction).GetName() == configured.ClientSecret {
+			secretGets++
+		}
+		return false, nil, nil
+	})
+	probeRequest := rotation.VerificationRequest{Domain: domain, Generation: 7, Targets: probeTargets, Publication: publication}
+	if err := probeServiceMTLSWithAddressDial(ctx, cluster, names, probeRequest,
+		func(ctx context.Context, config *tls.Config, address string) (*tls.Conn, error) {
+			seen = append(seen, address)
+			switch len(seen) {
+			case 1:
+				return serviceDial(ctx, config)
+			case 2:
+				return secondPodDial(ctx, config)
+			case 3:
+				return firstPodDial(ctx, config)
+			default:
+				return nil, errors.New("unexpected extra probe")
+			}
+		}); err != nil {
+		t.Fatalf("probe every Ready server: %v", err)
+	}
+	if len(seen) != 3 || seen[0] != "api.servers.svc:443" ||
+		seen[1] != "10.0.0.8:18086" || seen[2] != "10.0.0.7:18086" {
+		t.Fatalf("probe addresses = %#v", seen)
+	}
+	if secretGets != 1 {
+		t.Fatalf("client Secret GETs = %d, want one per complete probe", secretGets)
+	}
+	for _, result := range []<-chan error{serviceResult, secondPodResult, firstPodResult} {
+		if err := <-result; err != nil {
+			t.Fatalf("direct-probe handshake: %v", err)
+		}
+	}
+	freshServiceDial, freshServiceResult := startMTLSPipe(t, serverSecret)
+	if err := probeServiceMTLSWithAddressDial(ctx, cluster, names, probeRequest,
+		func(ctx context.Context, config *tls.Config, address string) (*tls.Conn, error) {
+			if address == "10.0.0.8:18086" {
+				return nil, errors.New("stale broker identity")
+			}
+			return freshServiceDial(ctx, config)
+		}); err == nil {
+		t.Fatal("accepted one Ready broker that failed direct TLS verification")
+	}
+	if err := <-freshServiceResult; err != nil {
+		t.Fatal(err)
+	}
+	verifier.Probe = func(context.Context, rotation.VerificationRequest) error { return nil }
+	if _, err := verifier.Verify(ctx, probeRequest); err != nil {
+		t.Fatalf("probe-only server needed a Lease: %v", err)
+	}
+}
+
+func TestServicePodProbePortUsesServiceTargetPort(t *testing.T) {
+	ctx := context.Background()
+	pod := readyServicePod("servers", "broker", "broker-uid", nil)
+	pod.Status.PodIP = "10.0.0.9"
+	pod.Spec.Containers = []corev1.Container{{Name: "broker", Ports: []corev1.ContainerPort{{Name: "control", ContainerPort: 18086}}}}
+	cluster := fake.NewSimpleClientset(pod)
+	configured := ServiceMTLSNames{ServerNamespace: "servers"}
+	target := rotation.Target{ID: "server:broker-uid", Evidence: map[string]string{
+		"podNamespace": "servers", "podName": "broker", "podUID": "broker-uid", "podIP": pod.Status.PodIP,
+	}}
+	for _, test := range []struct {
+		name       string
+		targetPort intstr.IntOrString
+		want       int32
+	}{
+		{name: "numeric", targetPort: intstr.FromInt32(7446), want: 7446},
+		{name: "named", targetPort: intstr.FromString("control"), want: 18086},
+		{name: "default", want: 443},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			port, err := servicePodProbePort(ctx, cluster, configured,
+				corev1.ServicePort{Port: 443, TargetPort: test.targetPort}, target)
+			if err != nil || port != test.want {
+				t.Fatalf("Pod port = %d, error = %v; want %d", port, err, test.want)
+			}
+		})
+	}
+	stale := target
+	stale.Evidence = map[string]string{"podNamespace": "servers", "podName": "broker", "podUID": "stale", "podIP": pod.Status.PodIP}
+	if _, err := servicePodProbePort(ctx, cluster, configured,
+		corev1.ServicePort{Port: 443, TargetPort: intstr.FromString("control")}, stale); err == nil {
+		t.Fatal("accepted a named port from a replacement Pod")
+	}
+	if _, err := servicePodProbePort(ctx, cluster, configured,
+		corev1.ServicePort{Port: 443, TargetPort: intstr.FromString("missing")}, target); err == nil {
+		t.Fatal("accepted an unresolved named target port")
+	}
+}
+
+func TestServiceProbePortRejectsAmbiguousServicePort(t *testing.T) {
+	service := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: "servers", Name: "api"},
+		Spec: corev1.ServiceSpec{Ports: []corev1.ServicePort{{Name: "first", Port: 443}, {Name: "second", Port: 443}}}}
+	cluster := fake.NewSimpleClientset(service)
+	if _, err := serviceProbePort(context.Background(), cluster,
+		ServiceMTLSNames{ServerNamespace: "servers", ServerService: "api", ServerPort: 443}); err == nil {
+		t.Fatal("accepted ambiguous Service port")
 	}
 }
 

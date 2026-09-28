@@ -77,6 +77,7 @@ type ServiceMTLSNames struct {
 	ServerSecret      string
 	ServerPodSelector string
 	ServerPort        int32
+	ServerProbeOnly   bool
 	ClientNamespace   string
 	ClientSecret      string
 	ClientPodSelector string
@@ -506,11 +507,11 @@ func (d Discoverer) Discover(ctx context.Context, domain rotation.Domain) ([]rot
 			return nil, err
 		}
 		targets := []rotation.Target{{ID: bindingTargetID(domain), Evidence: map[string]string{"role": "server", "probeOnly": "true"}}}
-		serverTargets, err := d.servicePodTargets(ctx, configured.ServerNamespace, configured.ServerPodSelector, "server")
+		serverTargets, err := d.servicePodTargets(ctx, configured.ServerNamespace, configured.ServerPodSelector, "server", configured.ServerProbeOnly)
 		if err != nil {
 			return nil, fmt.Errorf("discover service-mTLS server consumers: %w", err)
 		}
-		clientTargets, err := d.servicePodTargets(ctx, configured.ClientNamespace, configured.ClientPodSelector, "client")
+		clientTargets, err := d.servicePodTargets(ctx, configured.ClientNamespace, configured.ClientPodSelector, "client", false)
 		if err != nil {
 			return nil, fmt.Errorf("discover service-mTLS client consumers: %w", err)
 		}
@@ -531,7 +532,7 @@ func bindingTargetID(domain rotation.Domain) string {
 	return "probe:" + domain.Name + ":" + binding
 }
 
-func (d Discoverer) servicePodTargets(ctx context.Context, namespace, selector, role string) ([]rotation.Target, error) {
+func (d Discoverer) servicePodTargets(ctx context.Context, namespace, selector, role string, probeOnly bool) ([]rotation.Target, error) {
 	pods, err := d.Client.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
 	if err != nil {
 		return nil, err
@@ -546,9 +547,17 @@ func (d Discoverer) servicePodTargets(ctx context.Context, namespace, selector, 
 		if err != nil {
 			return nil, err
 		}
-		targets = append(targets, rotation.Target{ID: id, Evidence: map[string]string{
+		evidence := map[string]string{
 			"role": role, "podName": pod.Name, "podNamespace": pod.Namespace, "podUID": string(pod.UID),
-		}})
+		}
+		if probeOnly {
+			if !pod.Spec.HostNetwork || net.ParseIP(pod.Status.PodIP) == nil {
+				return nil, fmt.Errorf("probe-only server Pod %s/%s must have host networking and a valid Pod IP", pod.Namespace, pod.Name)
+			}
+			evidence["probeOnly"] = "true"
+			evidence["podIP"] = pod.Status.PodIP
+		}
+		targets = append(targets, rotation.Target{ID: id, Evidence: evidence})
 	}
 	return targets, nil
 }

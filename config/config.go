@@ -71,6 +71,8 @@ type ServiceMTLSServer struct {
 	Secret      string            `yaml:"secret" json:"secret"`
 	PodSelector map[string]string `yaml:"podSelector" json:"podSelector"`
 	Port        int32             `yaml:"port" json:"port"`
+	// ProbeOnly verifies every Ready host-network server directly when it has no API token for Lease acknowledgements.
+	ProbeOnly bool `yaml:"probeOnly,omitempty" json:"probeOnly,omitempty"`
 }
 
 // ServiceMTLSClient describes the client identity and its exact consumers.
@@ -338,6 +340,7 @@ func (f File) DomainHash(domain string) string {
 			parts = append(parts,
 				service.EffectiveClusterDomain(),
 				service.Server.Namespace, service.Server.Service, service.Server.Secret, fmt.Sprintf("%d", service.Server.Port),
+				fmt.Sprintf("%t", service.Server.ProbeOnly),
 				service.Client.Namespace, service.Client.Secret,
 			)
 			parts = appendSelector(parts, service.Server.PodSelector)
