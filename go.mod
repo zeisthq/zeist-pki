@@ -2,7 +2,7 @@ module github.com/zeisthq/zeist-pki
 
 go 1.26.0
 
-toolchain go1.26.4
+toolchain go1.26.10
 
 require (
 	github.com/zeisthq/zeist-pki/contract v1.0.0
