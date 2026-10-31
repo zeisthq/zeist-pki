@@ -23,6 +23,7 @@ jobs:
     timeout-minutes: 30
     env:
       IMAGE: ghcr.io/${{ github.repository }}
+      GOTOOLCHAIN: local
 
     steps:
       - name: Check out the release tag
@@ -33,7 +34,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
-          go-version-file: go.mod
+          go-version: '1.26.10'
           cache: true
 
       - name: Require a mainline release tag
@@ -41,6 +42,7 @@ jobs:
 
       - name: Test tagged source
         run: |
+          test "$(go env GOVERSION)" = go1.26.10
           go test ./...
           cd contract
           go test ./...
@@ -61,6 +63,7 @@ jobs:
             CGO_ENABLED=0 GOOS="${goos}" GOARCH="${goarch}" \
               go build -trimpath -buildvcs=true -ldflags="-s -w" \
               -o "${stage}/zeist-pki" ./cmd/zeist-pki
+            test "$(go version "${stage}/zeist-pki")" = "${stage}/zeist-pki: go1.26.10"
             cp LICENSE "${stage}/LICENSE"
             tar --owner=0 --group=0 --numeric-owner \
               --mtime="@${SOURCE_DATE_EPOCH:-0}" \
